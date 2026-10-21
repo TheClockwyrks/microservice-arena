@@ -1,0 +1,148 @@
+# The workspace of the microservice-arena repository. Every crate under crates/ is a
+# member; add a crate by adding its directory.
+[workspace]
+# The resolver of edition 2024, the monorepo's, so a crate resolves the same
+# features and the same MSRV-aware versions on both sides of an extraction.
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+repository = "https://github.com/TheClockwyrks/microservice-arena"
+# A crate of The Test Cabinet is consumed by its git source, never from
+# crates.io, so none is published; a member says `publish.workspace = true`, and
+# Cargo refuses that key when the root holds none to inherit.
+publish = false
+
+# Warnings-as-errors, baked into the manifests for every member crate that
+# opts in with `[lints] workspace = true`, so a plain `cargo build` enforces
+# the policy the clippy gate enforces on the command line.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+# `foray-core` and `lattice-core`, from the engines repository, are `cdylib`s (each
+# compiles to `wasm32-unknown-unknown` for the browser playback ABI), so on the native
+# host rustc's incremental codegen for the otherwise unused `.so`, split across the dev
+# profile's codegen units, intermittently drops a `*.rcgu.o` object and fails the link.
+# One codegen unit removes the race. `lattice-core` is the Lattice oracle, written for
+# clarity rather than speed, so it is built optimised even in a development build;
+# its integer fixed-point answers are the same at either level. The engines
+# repository's own manifest carries the same pins and their full account.
+[profile.dev.package.foray-core]
+codegen-units = 1
+
+[profile.dev.package.lattice-core]
+codegen-units = 1
+opt-level = 3
+
+# Cranelift compiles wasm modules in test processes: the Foray and Lattice hosts of the
+# engines repository, which the arena links through the match runner,
+# compile each controller with wasmtime, and `cargo nextest` runs ONE PROCESS PER TEST.
+# These are the crates that compile a module and read its debug information —
+# Cranelift, wasmtime's compile path and the DWARF readers — none of them workspace
+# members, so optimising them changes no behaviour under test and makes each compile
+# cheaper; the cost is one slower first build. gg's own manifest carries the same pins
+# for its sandbox's components.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen-shared]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+
+[profile.dev.package.cranelift-control]
+opt-level = 3
+
+[profile.dev.package.cranelift-native]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-core]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
+[profile.dev.package.gimli]
+opt-level = 3
+
+[profile.dev.package.addr2line]
+opt-level = 3
+
+[profile.dev.package.object]
+opt-level = 3
+
+# The crates of the other repositories this one may depend on, each at its
+# public source, the GitHub mirror, and the tag its dependents pin. The
+# superrepo's .cargo/config.toml redirects every one of these to the sibling
+# checkout, so a build inside the superrepo never fetches them. A manifest
+# never names an Azure URL or a path outside the repository: the
+# dependency-edges gate refuses both.
+[workspace.dependencies]
+test-cabinet-contracts = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
+test-cabinet-backend-client = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
+test-cabinet-telemetry = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
+test-cabinet-match-play = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.2" }
+foray-core = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.2" }
+
+# The third-party crates the members share, at the requirements the superrepo
+# holds the same crates to, so a service resolves the versions its peers do.
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+cuid2 = "0.1"
+dotenvy = "0.15"
+futures-util = "0.3"
+http = "1"
+# RS256 through the pure-Rust `rust_crypto` backend, so the portable musl build
+# needs no C toolchain; no PEM parsing, since the keys arrive as JWK components.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+opentelemetry = "0.32"
+# TLS through rustls so the image needs no system OpenSSL; `json` for the
+# backend's bodies; `stream` as the superrepo names it, so the arena resolves
+# the features its peers do.
+reqwest = { version = "0.12", default-features = false, features = [
+	"json",
+	"rustls-tls",
+	"stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = [
+	"trace",
+	"limit",
+	"cors",
+	"compression-gzip",
+] }
+tracing = "0.1"

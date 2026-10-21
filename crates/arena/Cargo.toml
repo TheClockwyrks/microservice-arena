@@ -1,8 +1,10 @@
 [package]
 name = "test-cabinet-arena"
+description = "The arena: adversarial matches and tournaments, run as CPU-bound wasm off the backend."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [[bin]]
