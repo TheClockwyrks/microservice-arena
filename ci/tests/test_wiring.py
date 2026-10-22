@@ -88,6 +88,12 @@ DATA_CHECKOUTS: dict[str, str] = {}
 RUST_DIR = ""
 SOURCES = "$(Build.SourcesDirectory)"
 RUST_ROOT = f"{SOURCES}/{RUST_DIR}" if RUST_DIR else SOURCES
+# The same for the checks job, which a kind carrying no crate runs its tests
+# in: the repositories it checks out beside this one, each to the variable
+# naming its checkout, and the directory this repository's checkout is in.
+CHECKS_CHECKOUTS: dict[str, str] = {}
+CHECKS_DIR = ""
+CHECKS_ROOT = f"{SOURCES}/{CHECKS_DIR}" if CHECKS_DIR else SOURCES
 CHECKOUT = re.compile(r"^          - checkout: (?P<name>\S+) *\n(?P<keys>(?:            .*\n)*)", re.MULTILINE)
 IMAGE_ENDPOINT = "the-test-cabinet-acr"
 IMAGE = re.compile(r"^testcabinet\.azurecr\.io/ubuntu-the-test-cabinet-(?P<image>[a-z0-9-]+)-cicd:[0-9a-f]{40}$")
@@ -121,7 +127,10 @@ IMAGE_POOLS = {"amd64": "vmImage: ubuntu-24.04", "arm64": "name: pool-dev-linux-
 IMAGE_SCRIPT = "scripts/ci/image.sh"
 MANIFEST_SCRIPT = "scripts/ci/manifest.sh"
 BUILD_CONTEXT_GATE = "build-context"
+# The rewrite of the public sources to Azure, which a kind carrying a crate
+# runs before it fetches and one carrying none is rendered without.
 GIT_SOURCES_SCRIPT = "scripts/ci/git-sources.sh"
+FETCHES_SOURCES = True
 # The feed a job authenticates npm to before its first install, or nothing for
 # a kind that builds no workspace.
 FEED_SCRIPT_REGISTRY = "https://pkgs.dev.azure.com/genyume/the-test-cabinet/_packaging/the-test-cabinet/npm/registry/"
@@ -357,21 +366,7 @@ def test_every_declared_repository_is_an_azure_one_on_master() -> None:
 
 def _uses(job: str) -> list[str]:
     """The repositories a job says it uses, ahead of its steps."""
-    return re.findall(r"^            - ([a-z0-9-]+) *$", job[: job.index("steps:")], re.MULTILINE)
-
-
-def test_the_rust_track_uses_every_repository_it_declares() -> None:
-    """A declared resource scopes the token only once a job says it uses it.
-
-    The Rust track fetches what its manifests may reach, the closure of this
-    repository's Rust edges, checks out each repository its suite reads across
-    a data edge, and uses every repository the pipeline declares.
-    """
-    used = _uses(_gates_jobs()["rust"])
-    declared = sorted(_repository_resources())
-    expected = sorted({*FETCHED, *DATA_CHECKOUTS})
-    assert sorted(used) == declared, f"the Rust track uses {sorted(used)} and the pipeline declares {declared}"
-    assert declared == expected, f"the pipeline declares {declared}, not the closure and the checkouts {expected}"
+    return re.findall(r"^            - ([a-z0-9.-]+) *$", job[: job.index("steps:")], re.MULTILINE)
 
 
 def _checkouts(job: str) -> dict[str, str]:
@@ -386,6 +381,20 @@ def _checkouts(job: str) -> dict[str, str]:
 def _all_jobs() -> dict[str, str]:
     """Every job of every stage, by stage and job."""
     return {f"{stage}/{job}": steps for stage, text in _stages().items() for job, steps in _sections(JOB, text).items()}
+
+
+def test_the_rust_track_uses_every_repository_it_declares() -> None:
+    """A declared resource scopes the token only once a job says it uses it.
+
+    The Rust track fetches what its manifests may reach, the closure of this
+    repository's Rust edges, checks out each repository its suite reads across
+    a data edge, and uses every repository the pipeline declares.
+    """
+    used = _uses(_gates_jobs()["rust"])
+    declared = sorted(_repository_resources())
+    expected = sorted({*FETCHED, *DATA_CHECKOUTS})
+    assert sorted(used) == declared, f"the Rust track uses {sorted(used)} and the pipeline declares {declared}"
+    assert declared == expected, f"the pipeline declares {declared}, not the closure and the checkouts {expected}"
 
 
 def test_the_rust_job_checks_out_each_data_repository_beside_this_one() -> None:
@@ -408,17 +417,6 @@ def test_the_rust_job_checks_out_each_data_repository_beside_this_one() -> None:
     for repo, variable in DATA_CHECKOUTS.items():
         assert re.search(rf"^          {variable}: {re.escape(SOURCES)}/{repo} *$", head, re.MULTILINE), (
             f"the Rust job does not name the {repo} checkout to the suite as {variable}"
-        )
-
-
-def test_no_other_job_checks_out_a_data_repository() -> None:
-    for job, steps in _all_jobs().items():
-        if job == "gates/rust":
-            continue
-        checkouts = _checkouts(steps)
-        assert set(checkouts) <= {"self"}, f"the {job} job checks out {sorted(checkouts)}"
-        assert "path:" not in "".join(match.group("keys") for match in CHECKOUT.finditer(steps)), (
-            f"the {job} job checks this repository out away from the sources directory"
         )
 
 
@@ -485,6 +483,58 @@ def test_the_rust_job_prunes_its_build_output_last() -> None:
     pipeline = PIPELINE.read_text(encoding="utf-8")
     assert pipeline.count(f"- script: {PRUNE_SCRIPT} ") == 1, "the prune runs outside the Rust job"
     assert (ROOT / PRUNE_SCRIPT).is_file(), f"the pipeline runs {PRUNE_SCRIPT}, which the repository does not hold"
+
+
+def test_the_checks_job_checks_out_each_data_repository_beside_this_one() -> None:
+    """Each repository the tests read across a data edge is checked out beside this one and named by its variable.
+
+    A second checkout puts every repository at its name under the sources
+    directory, so `<this repository>/../<data repository>` reaches it as in the
+    superrepo; a lone checkout keeps the sources directory as this
+    repository's own.
+    """
+    checks = _gates_jobs()["checks"]
+    checkouts = _checkouts(checks)
+    if not CHECKS_CHECKOUTS:
+        assert checkouts == {"self": ""}, f"the checks job checks out {checkouts}, not this repository alone"
+        assert "        variables:\n" not in checks[: checks.index("steps:")], "the checks job names a data checkout"
+        return
+    expected = {"self": f"s/{CHECKS_DIR}", **{repo: f"s/{repo}" for repo in CHECKS_CHECKOUTS}}
+    assert checkouts == expected, f"the checks job checks out {checkouts}, not {expected}"
+    assert list(checkouts) == list(expected), "the checks job does not check this repository out first"
+    head = checks[: checks.index("steps:")]
+    for repo, variable in CHECKS_CHECKOUTS.items():
+        assert re.search(rf"^          {variable}: {re.escape(SOURCES)}/{repo} *$", head, re.MULTILINE), (
+            f"the checks job does not name the {repo} checkout to the tests as {variable}"
+        )
+
+
+def test_every_checks_step_runs_in_this_repositorys_checkout() -> None:
+    """Every script of the checks job runs where this repository is checked out, and publishes from there."""
+    checks = _gates_jobs()["checks"]
+    starts = [match.start() for match in STEP.finditer(checks)]
+    scripts = [_step_at(checks, at) for at in starts if checks.startswith("          - script:", at)]
+    assert scripts, "the checks job runs no script"
+    workdir = f"            workingDirectory: {CHECKS_ROOT}\n"
+    for step in scripts:
+        if CHECKS_DIR:
+            assert workdir in step, f"a step of the checks job runs outside {CHECKS_ROOT}:\n{step}"
+        else:
+            assert "workingDirectory:" not in step, f"a step of the checks job names a directory:\n{step}"
+    for results in re.findall(r"^              testResultsFiles: (\S+) *$", checks, re.MULTILINE):
+        assert results.startswith(f"{CHECKS_ROOT}/target/"), f"the checks job publishes {results}, outside its checkout"
+
+
+def test_no_other_job_checks_out_a_data_repository() -> None:
+    """The gates' jobs alone check a data repository out, each held above; every other job checks out itself."""
+    for job, steps in _all_jobs().items():
+        if job in ("gates/rust", "gates/checks"):
+            continue
+        checkouts = _checkouts(steps)
+        assert set(checkouts) <= {"self"}, f"the {job} job checks out {sorted(checkouts)}"
+        assert "path:" not in "".join(match.group("keys") for match in CHECKOUT.finditer(steps)), (
+            f"the {job} job checks this repository out away from the sources directory"
+        )
 
 
 def test_the_checks_track_installs_the_npm_workspace_first() -> None:
@@ -637,8 +687,12 @@ def test_each_architecture_builds_natively_and_pushes_its_tag() -> None:
         sources = job.find(f"- script: {GIT_SOURCES_SCRIPT}\n")
         login = job.find("- task: Docker@2\n")
         build = job.find(f'- script: {IMAGE_SCRIPT} {IMAGE_NAME} "$(Build.SourceVersion)"\n')
-        assert 0 <= sources < login < build, f"the {arch} job does not rewrite the sources, log in, then build"
-        assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in _step_at(job, job.rindex("\n", 0, sources) + 1)
+        if FETCHES_SOURCES:
+            assert 0 <= sources < login < build, f"the {arch} job does not rewrite the sources, log in, then build"
+            assert "SYSTEM_ACCESSTOKEN: $(System.AccessToken)" in _step_at(job, job.rindex("\n", 0, sources) + 1)
+        else:
+            assert sources < 0, f"the {arch} job rewrites the sources of a build that fetches no repository"
+            assert 0 <= login < build, f"the {arch} job does not log in, then build"
         if FEED_SCRIPT_REGISTRY:
             # The build is handed npm's configuration as a secret, so it is written first.
             feed = job.find(f"- script: {NPM_FEED_SCRIPT} {FEED_SCRIPT_REGISTRY}\n")
@@ -649,7 +703,7 @@ def test_each_architecture_builds_natively_and_pushes_its_tag() -> None:
             assert NPM_FEED_SCRIPT not in job, f"the {arch} job authenticates to a feed its kind never installs from"
         assert f"containerRegistry: {IMAGE_ENDPOINT}\n" in _step_at(job, job.rindex("\n", 0, login) + 1)
     assert (ROOT / IMAGE_SCRIPT).is_file(), f"the pipeline runs {IMAGE_SCRIPT}, which the repository does not hold"
-    assert (ROOT / GIT_SOURCES_SCRIPT).is_file()
+    assert (ROOT / GIT_SOURCES_SCRIPT).is_file() is FETCHES_SOURCES
 
 
 def test_the_manifest_job_fuses_the_architectures_last() -> None:
