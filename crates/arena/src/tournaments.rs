@@ -1,36 +1,24 @@
-//! The async tournament-job model.
+//! The tournaments this arena process is driving, and their live progress.
 //!
-//! A tournament runs `C(n,2)` matches and can take a while, so the arena service
-//! does not hold the HTTP request open for it. `POST /tournaments` submits a job and
-//! returns its id (the tournament id); the matches run on a background task that
-//! records progress here. The caller observes it out of band:
-//! `GET /tournaments/{job}/events` streams per-match progress as NDJSON, and
-//! `GET /tournaments/{job}` reports status (and the finished record). Once complete,
-//! the service publishes the tournament to the backend, where the gallery reads it.
+//! A tournament's record lives on the backend (the arena overview's "Durable
+//! tournaments"): its state, its pairings and every recorded match. What lives
+//! here is only what a process adds while it drives one: a live channel each
+//! completed match is published to as it is recorded, which
+//! `GET /tournaments/{id}/events` tails after replaying the recorded matches.
+//! The registry is also how the arena knows which tournaments it is already
+//! driving, so a resume never drives one twice.
 //!
-//! This registry is **per-pod, in memory** — it is why the arena Deployment runs a
-//! single replica (a tournament's job handle and live channel live only in the pod
-//! that accepted it).
+//! The channel is per-pod, which is one reason the Deployment runs a single
+//! replica.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use test_cabinet_match_play::{MatchSummary, TournamentRecord};
+use test_cabinet_match_play::{
+    MatchSummary, RecordedTournament, TournamentRecord, TournamentState,
+};
 use tokio::sync::broadcast;
-
-/// Where a submitted tournament is in its lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TournamentState {
-    /// Accepted and running its matches.
-    Running,
-    /// Every match ran and the tournament was published to the backend.
-    Succeeded,
-    /// The tournament could not be completed (a controller could not be resolved,
-    /// the engine failed, or publishing failed). `detail` carries the reason.
-    Failed,
-}
 
 /// One match's completion, streamed as the field plays out so the UI can show a
 /// live tournament board. Carries the full [`MatchSummary`] plus how far along the
@@ -38,7 +26,7 @@ pub enum TournamentState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TournamentProgress {
-    /// How many matches have completed (1-based).
+    /// How many matches have a recorded result, this one included (1-based).
     pub played: usize,
     /// How many matches the field has in total (`C(n,2)`).
     pub total: usize,
@@ -46,11 +34,12 @@ pub struct TournamentProgress {
     pub summary: MatchSummary,
 }
 
-/// A point-in-time view of a tournament job.
+/// A tournament's status as `GET /tournaments/{id}` answers it, read from the
+/// backend's record.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TournamentJobStatus {
-    /// The job id (= the tournament id).
+pub struct TournamentStatus {
+    /// The tournament id.
     pub id: String,
     /// Lifecycle state.
     pub state: TournamentState,
@@ -62,130 +51,34 @@ pub struct TournamentJobStatus {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct JobInner {
-    state: StateInner,
-    progress: Vec<TournamentProgress>,
-}
-
-#[derive(Debug, Default)]
-enum StateInner {
-    #[default]
-    Running,
-    Succeeded(Box<TournamentRecord>),
-    Failed(String),
+impl From<RecordedTournament> for TournamentStatus {
+    fn from(recorded: RecordedTournament) -> Self {
+        Self {
+            id: recorded.record.id.clone(),
+            state: recorded.state,
+            record: (recorded.state == TournamentState::Succeeded).then_some(recorded.record),
+            detail: recorded.detail,
+        }
+    }
 }
 
 /// An item delivered to a tournament's live stream.
 #[derive(Debug, Clone)]
 pub enum StreamItem {
-    /// A completed match.
+    /// A recorded match.
     Progress(Box<TournamentProgress>),
-    /// The tournament reached a terminal state; no further items will arrive.
+    /// This process stopped driving the tournament; no further items will arrive.
     Done,
-}
-
-/// A handle to one tracked tournament job.
-#[derive(Debug, Clone)]
-pub struct TournamentJob {
-    id: String,
-    inner: Arc<Mutex<JobInner>>,
-    tx: broadcast::Sender<StreamItem>,
-}
-
-impl TournamentJob {
-    /// The job/tournament id.
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Append a completed match and publish it to live subscribers.
-    pub fn push_progress(&self, progress: TournamentProgress) {
-        {
-            let mut inner = self.inner.lock().expect("tournament job mutex poisoned");
-            inner.progress.push(progress.clone());
-        }
-        let _ = self.tx.send(StreamItem::Progress(Box::new(progress)));
-    }
-
-    /// Mark the tournament succeeded with its record, then close the stream.
-    pub fn finish_succeeded(&self, record: TournamentRecord) {
-        {
-            let mut inner = self.inner.lock().expect("tournament job mutex poisoned");
-            inner.state = StateInner::Succeeded(Box::new(record));
-        }
-        let _ = self.tx.send(StreamItem::Done);
-    }
-
-    /// Mark the tournament failed with a reason, then close the stream.
-    pub fn finish_failed(&self, detail: impl Into<String>) {
-        {
-            let mut inner = self.inner.lock().expect("tournament job mutex poisoned");
-            inner.state = StateInner::Failed(detail.into());
-        }
-        let _ = self.tx.send(StreamItem::Done);
-    }
-
-    /// A point-in-time status snapshot.
-    pub fn status(&self) -> TournamentJobStatus {
-        let inner = self.inner.lock().expect("tournament job mutex poisoned");
-        match &inner.state {
-            StateInner::Running => TournamentJobStatus {
-                id: self.id.clone(),
-                state: TournamentState::Running,
-                record: None,
-                detail: None,
-            },
-            StateInner::Succeeded(record) => TournamentJobStatus {
-                id: self.id.clone(),
-                state: TournamentState::Succeeded,
-                record: Some((**record).clone()),
-                detail: None,
-            },
-            StateInner::Failed(detail) => TournamentJobStatus {
-                id: self.id.clone(),
-                state: TournamentState::Failed,
-                record: None,
-                detail: Some(detail.clone()),
-            },
-        }
-    }
-
-    /// Subscribe to the live progress stream: the backlog so far plus a live
-    /// receiver, and whether the job is already terminal.
-    pub fn subscribe(&self) -> Subscription {
-        let inner = self.inner.lock().expect("tournament job mutex poisoned");
-        let backlog = inner.progress.clone();
-        let terminated = !matches!(inner.state, StateInner::Running);
-        let receiver = self.tx.subscribe();
-        drop(inner);
-        Subscription {
-            backlog,
-            receiver,
-            terminated,
-        }
-    }
-}
-
-/// What a new subscriber receives: the replayed backlog, a live receiver, and
-/// whether the tournament had already finished at subscribe time.
-pub struct Subscription {
-    /// Matches completed before this subscription, replayed in order.
-    pub backlog: Vec<TournamentProgress>,
-    /// Live items published after this subscription was taken.
-    pub receiver: broadcast::Receiver<StreamItem>,
-    /// Whether the job was already terminal when subscribed.
-    pub terminated: bool,
 }
 
 /// The capacity of each tournament's live progress channel.
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
 
-/// The set of all tracked tournament jobs, keyed by id. `Arc`-backed so the router
-/// state and each background task share one registry.
+/// The tournaments this process is driving, keyed by id. `Arc`-backed so the
+/// router state and each drive share one registry.
 #[derive(Debug, Clone, Default)]
 pub struct TournamentRegistry {
-    jobs: Arc<Mutex<HashMap<String, TournamentJob>>>,
+    live: Arc<Mutex<HashMap<String, broadcast::Sender<StreamItem>>>>,
 }
 
 impl TournamentRegistry {
@@ -194,28 +87,85 @@ impl TournamentRegistry {
         Self::default()
     }
 
-    /// Register a fresh tournament job under a new id and return its handle.
-    pub fn create(&self) -> TournamentJob {
-        let id = cuid2::create_id();
-        let (tx, _rx) = broadcast::channel(PROGRESS_CHANNEL_CAPACITY);
-        let job = TournamentJob {
-            id: id.clone(),
-            inner: Arc::new(Mutex::new(JobInner::default())),
-            tx,
-        };
-        self.jobs
+    /// Start driving tournament `id`: open its live channel and answer the guard
+    /// that publishes to it and closes it on drop. `None` when this process is
+    /// already driving it.
+    pub fn register(&self, id: &str) -> Option<LiveTournament> {
+        let mut live = self
+            .live
             .lock()
-            .expect("tournament registry mutex poisoned")
-            .insert(id, job.clone());
-        job
+            .expect("tournament registry mutex poisoned");
+        if live.contains_key(id) {
+            return None;
+        }
+        let (tx, _rx) = broadcast::channel(PROGRESS_CHANNEL_CAPACITY);
+        live.insert(id.to_string(), tx.clone());
+        Some(LiveTournament {
+            id: id.to_string(),
+            tx,
+            registry: self.clone(),
+        })
     }
 
-    /// Look up a tournament job by id.
-    pub fn get(&self, id: &str) -> Option<TournamentJob> {
-        self.jobs
+    /// Subscribe to tournament `id`'s live channel, or `None` when this process is
+    /// not driving it. Taken under the registry's lock, which closing a channel
+    /// also takes, so a subscriber either receives [`StreamItem::Done`] or finds no
+    /// channel.
+    pub fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<StreamItem>> {
+        self.live
             .lock()
             .expect("tournament registry mutex poisoned")
             .get(id)
-            .cloned()
+            .map(broadcast::Sender::subscribe)
+    }
+
+    /// Whether this process is driving tournament `id`.
+    pub fn is_live(&self, id: &str) -> bool {
+        self.live
+            .lock()
+            .expect("tournament registry mutex poisoned")
+            .contains_key(id)
+    }
+
+    /// Close tournament `id`'s channel: remove it and tell every subscriber.
+    fn close(&self, id: &str) {
+        let mut live = self
+            .live
+            .lock()
+            .expect("tournament registry mutex poisoned");
+        if let Some(tx) = live.remove(id) {
+            let _ = tx.send(StreamItem::Done);
+        }
     }
 }
+
+/// The live channel of a tournament this process is driving. Dropping it closes
+/// the channel, so every way a drive ends ends its streams.
+#[derive(Debug)]
+pub struct LiveTournament {
+    id: String,
+    tx: broadcast::Sender<StreamItem>,
+    registry: TournamentRegistry,
+}
+
+impl LiveTournament {
+    /// The tournament id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Publish a recorded match to every live subscriber.
+    pub fn push(&self, progress: TournamentProgress) {
+        let _ = self.tx.send(StreamItem::Progress(Box::new(progress)));
+    }
+}
+
+impl Drop for LiveTournament {
+    fn drop(&mut self) {
+        self.registry.close(&self.id);
+    }
+}
+
+#[cfg(test)]
+#[path = "tournaments.test.rs"]
+mod tests;

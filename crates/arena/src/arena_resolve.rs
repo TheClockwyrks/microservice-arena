@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use test_cabinet_backend_client::BackendClient;
+use test_cabinet_backend_client::{BackendClient, Error as ClientError};
 use test_cabinet_match_play::{
     ARENA_OPPONENT_IDS, ControllerKind, ControllerRef, ResolvedController,
 };
@@ -27,6 +27,52 @@ use test_cabinet_match_play::{
 /// address its served `references/<id>.wasm`).
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
+}
+
+/// Why a test case version or a controller did not resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// It does not resolve and will not: the arena refuses the controller, or the
+    /// backend answered that what was asked for does not exist.
+    Refused(String),
+    /// The backend could not be reached or failed to answer, so whether it
+    /// resolves is not known yet.
+    Unavailable(String),
+}
+
+impl ResolveError {
+    /// Classify a backend client failure, prefixed with `context`. The client
+    /// carries a refusal's status only in its message, so a `404` is read from
+    /// there; every other failure may pass.
+    pub fn from_client(context: &str, err: &ClientError) -> Self {
+        let message = format!("{context}: {err}");
+        if message.contains("(404 Not Found)") {
+            Self::Refused(message)
+        } else {
+            Self::Unavailable(message)
+        }
+    }
+
+    /// A backend that gave no answer within `timeout`, prefixed with `context`.
+    pub fn unanswered(context: &str, timeout: std::time::Duration) -> Self {
+        Self::Unavailable(format!(
+            "{context}: no answer within {}s",
+            timeout.as_secs()
+        ))
+    }
+
+    /// Whether the failure may pass, so the call is worth trying again.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(message) | Self::Unavailable(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Resolve one controller's wasm bytes for `slug`@`version` against the backend.
@@ -40,9 +86,12 @@ pub async fn resolve_controller(
     slug: &str,
     version: &str,
     controller: &ControllerRef,
-) -> Result<ResolvedController, String> {
+) -> Result<ResolvedController, ResolveError> {
     if !is_safe_id(&controller.id) {
-        return Err(format!("invalid controller id `{}`", controller.id));
+        return Err(ResolveError::Refused(format!(
+            "invalid controller id `{}`",
+            controller.id
+        )));
     }
     let wasm = match controller.kind {
         ControllerKind::Baseline => {
@@ -50,13 +99,21 @@ pub async fn resolve_controller(
             // (it includes the hidden references like `fuel-probe`), so resolve
             // against `ARENA_OPPONENT_IDS`.
             if !ARENA_OPPONENT_IDS.contains(&controller.id.as_str()) {
-                return Err(format!("unknown baseline `{}`", controller.id));
+                return Err(ResolveError::Refused(format!(
+                    "unknown baseline `{}`",
+                    controller.id
+                )));
             }
             let source = format!("references/{}.wasm", controller.id);
             client
                 .artifact(slug, version, Path::new(&source))
                 .await
-                .map_err(|err| format!("fetching baseline `{}`: {err}", controller.id))?
+                .map_err(|err| {
+                    ResolveError::from_client(
+                        &format!("fetching baseline `{}`", controller.id),
+                        &err,
+                    )
+                })?
                 .bytes
         }
         ControllerKind::Run => {
@@ -65,11 +122,11 @@ pub async fn resolve_controller(
             // controllers and baselines are resolvable here. The console never offers
             // a `Run` controller against the service; reject defensively if one
             // arrives.
-            return Err(format!(
+            return Err(ResolveError::Refused(format!(
                 "run-local controllers are not resolvable in the service topology (run `{}`); \
                  push the run first",
                 controller.id
-            ));
+            )));
         }
         ControllerKind::PushedRun => {
             // A pushed run's controller lives on the backend (uploaded at push), so
@@ -78,9 +135,9 @@ pub async fn resolve_controller(
                 .controller_artifact(&controller.id)
                 .await
                 .map_err(|err| {
-                    format!(
-                        "fetching pushed controller for run `{}`: {err}",
-                        controller.id
+                    ResolveError::from_client(
+                        &format!("fetching pushed controller for run `{}`", controller.id),
+                        &err,
                     )
                 })?
         }

@@ -1,138 +1,16 @@
-//! End-to-end tests for the arena service's HTTP surface, driving the real router
-//! against a tiny **stub backend** the test spins up. The stub answers exactly the
-//! endpoints the arena fetches from:
-//!
-//! - `GET /test-cases/{slug}/versions/{version}` (resolve a version — a minimal but
-//!   valid adversarial case carrying `[contract]`, `[sandbox]`, `[simulation]`),
-//! - `GET /test-cases/{slug}/versions/{version}/artifacts/references/{id}.wasm`
-//!   (a baseline's wasm — deliberately *invalid* bytes, so the match forfeits
-//!   cleanly without needing a real controller),
-//! - `GET /adversarial/controllers?testCase=` (the pushed-controller listing), and
-//! - `GET /runs/{id}/controller.wasm` (a pushed run's wasm).
+//! End-to-end tests for the arena service's match routes, driving the real router
+//! against the [stub backend](crate::stub_backend).
 //!
 //! With invalid wasm a match still returns a `MatchSummary` (a forfeit, `replay:
 //! null`), which is all the happy-path test asserts — no real wasm execution.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
+use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query};
 use axum::http::{Request, StatusCode};
-use axum::routing::get;
-use axum::{Json, Router};
 use tower::ServiceExt;
 
-use super::*;
 use crate::auth::LOCAL_IDENTITY_HEADER;
-use crate::executor::MatchExecutor;
-use crate::tournaments::TournamentRegistry;
-
-/// A minimal but valid adversarial `VersionBody` (camelCase): enough for
-/// `canonical_match_setup` to build a match (it needs `contract`, `sandbox` with
-/// `fuelPerTick`, and `simulation`).
-fn version_json(slug: &str, version: &str) -> serde_json::Value {
-    serde_json::json!({
-        "slug": slug,
-        "version": version,
-        "name": "Pacman Arena",
-        "difficulty": "medium",
-        "tags": ["adversarial"],
-        "summary": null,
-        "description": null,
-        "maxRuntimeSeconds": 600,
-        "engines": [{ "slug": "none" }],
-        "testType": "adversarial",
-        "contract": { "entry": "controller", "world": "world.wit", "action": "action.wit" },
-        "sandbox": { "fuelPerTick": 1_000_000, "maxMemoryBytes": 16_777_216u64 },
-        "simulation": { "timestepMs": 16, "maxTicks": 1024 },
-        "promptTemplate": "build a controller",
-        "commonSpecs": [],
-        "assets": [],
-        "variants": [],
-        "commonReferences": [],
-        "checks": []
-    })
-}
-
-/// The service token the stub backend takes.
-const SERVICE_TOKEN: &str = "svc-token";
-
-/// Refuse a request that does not present [`SERVICE_TOKEN`] with `401`, as the
-/// backend refuses a caller without an identity.
-async fn require_service_token(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let expected = format!("Bearer {SERVICE_TOKEN}");
-    let presented = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if presented == Some(expected.as_str()) {
-        next.run(request).await
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
-    }
-}
-
-/// Spawn the stub backend on an ephemeral port and return its base URL. It answers
-/// the four endpoints the arena fetches controller inputs from, to a caller
-/// presenting [`SERVICE_TOKEN`] only.
-async fn spawn_stub_backend() -> String {
-    let app = Router::new()
-        .route(
-            "/test-cases/{slug}/versions/{version}",
-            get(|Path((slug, version)): Path<(String, String)>| async move {
-                Json(version_json(&slug, &version))
-            }),
-        )
-        .route(
-            // A baseline's wasm, addressed as references/{id}.wasm. Invalid bytes:
-            // the match forfeits cleanly rather than needing a real module.
-            "/test-cases/{slug}/versions/{version}/artifacts/{*key}",
-            get(
-                |Path((_slug, _version, _key)): Path<(String, String, String)>| async move {
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "application/wasm")],
-                        b"\0not-wasm".to_vec(),
-                    )
-                },
-            ),
-        )
-        .route(
-            "/runs/{id}/controller.wasm",
-            get(|Path(_id): Path<String>| async move {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/wasm")],
-                    b"\0not-wasm".to_vec(),
-                )
-            }),
-        )
-        .route(
-            "/adversarial/controllers",
-            get(
-                |Query(params): Query<std::collections::HashMap<String, String>>| async move {
-                    let _ = params;
-                    Json(serde_json::json!({
-                        "controllers": [
-                            { "id": "run-xyz", "kind": "pushed", "label": "claude" }
-                        ]
-                    }))
-                },
-            ),
-        )
-        .layer(axum::middleware::from_fn(require_service_token));
-
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    format!("http://{addr}")
-}
+use crate::stub_backend::{SERVICE_TOKEN, arena_state, spawn_stub_backend};
 
 /// Build the arena router pointed at `backend_url`, with the given executor cap,
 /// presenting [`SERVICE_TOKEN`] to the backend.
@@ -140,16 +18,15 @@ fn app(backend_url: &str, cap: usize) -> Router {
     app_with_token(backend_url, cap, Some(SERVICE_TOKEN))
 }
 
-/// Build the arena router pointed at `backend_url`, presenting `token` (or none).
+/// Build the arena router pointed at `backend_url`, presenting `token` (or none),
+/// playing matches through the real runner.
 fn app_with_token(backend_url: &str, cap: usize, token: Option<&str>) -> Router {
-    let state = AppState {
-        backend_url: Arc::new(backend_url.trim_end_matches('/').to_string()),
-        backend_service_token: token.map(|t| Arc::new(t.to_string())),
-        tournaments: TournamentRegistry::new(),
-        executor: Arc::new(MatchExecutor::new(cap)),
-        access: None,
-    };
-    super::router(state)
+    super::router(arena_state(
+        backend_url,
+        cap,
+        token,
+        crate::drive::wasm_runner(),
+    ))
 }
 
 #[tokio::test]

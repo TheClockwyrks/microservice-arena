@@ -1,11 +1,12 @@
 //! The arena service's HTTP surface: list the controllers a case can pit, run one
 //! head-to-head match, submit a tournament, and observe a tournament live.
 //!
-//! All of these are the **execution** endpoints the deleted worker served and the
-//! web console still expects — the run-and-stream surface, not the read/publish one
-//! (published tournaments, stored replays, and controller listings are read from the
-//! backend). The handler/return shapes are ported verbatim from the worker so the
-//! console's hand-typed `httpArena.ts` reads them unchanged.
+//! All of these are the **execution** endpoints the console expects — the
+//! run-and-stream surface, not the gallery's reads (succeeded tournaments, stored
+//! replays, and controller listings are read from the backend). A tournament's
+//! status and its stream's backlog are read from the backend's record, so they
+//! answer the same from any arena process (the arena overview's "Durable
+//! tournaments").
 //!
 //! Every route but the health probe needs an identity, resolved by
 //! [`crate::auth::identify`]: the Access assertion every request through the edge
@@ -14,6 +15,7 @@
 //! `cloudflared` forwards unchanged. The CPU-bound wasm execution behind the routes
 //! is bounded by the [`MatchExecutor`] capacity guard.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -30,25 +32,26 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::broadcast::error::RecvError;
 use tower_http::cors::{AllowHeaders, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::Instrument as _;
 
 use foray_core::replay::Replay;
 use test_cabinet_backend_client::{BackendClient, HttpBackendClient};
 use test_cabinet_match_play::{
-    ControllerRef, MatchSummary, ResolvedController, run_quick_match, run_tournament,
+    ControllerRef, MatchSummary, PendingTournament, RecordedTournament, ResolvedController,
+    TournamentRecord, TournamentState, run_quick_match, tournament_pairings,
 };
 
 use crate::arena_resolve::{list_controllers, resolve_controller, with_pushed_controllers};
 use crate::auth::{AccessMode, EDGE_PREFIX};
+use crate::drive::{DriveStart, RetryPolicy, TournamentRunner, spawn_drive};
 use crate::error::ApiError;
 use crate::executor::MatchExecutor;
-use crate::tournaments::{
-    StreamItem, TournamentJob, TournamentJobStatus, TournamentProgress, TournamentRegistry,
-};
+use crate::shutdown::{Drives, Shutdown};
+use crate::tournaments::{StreamItem, TournamentProgress, TournamentRegistry, TournamentStatus};
 
 /// The shared handler state: the backend URL the service fetches inputs from and
-/// persists results to, the in-memory tournament registry (per-pod), the capacity
-/// guard the CPU-bound work runs through, and the Access verifier.
+/// records tournaments through, the live registry of the tournaments this process
+/// drives, the capacity guard the CPU-bound work runs through, the shutdown signal,
+/// and the Access verifier.
 #[derive(Clone)]
 pub struct AppState {
     /// The backend base URL (no trailing slash). Every handler builds a fresh
@@ -57,20 +60,28 @@ pub struct AppState {
     /// The shared service token presented on every backend call, or `None` when
     /// the service was configured without one.
     pub backend_service_token: Option<Arc<String>>,
-    /// The per-pod tournament-job tracker.
+    /// The tournaments this process is driving and their live channels.
     pub tournaments: TournamentRegistry,
     /// Bounds concurrent CPU-bound match/tournament execution.
     pub executor: Arc<MatchExecutor>,
     /// The Access verifier a request's assertion is checked with, or `None` when
     /// the arena takes a person's identity from the local identity header.
     pub access: AccessMode,
+    /// Begun on `SIGTERM`: no new match or tournament starts.
+    pub shutdown: Shutdown,
+    /// The tournament drives under way, which a shutdown waits for.
+    pub drives: Drives,
+    /// What plays a tournament's pairings.
+    pub runner: Arc<dyn TournamentRunner>,
+    /// How a write to the backend is retried before a drive is abandoned.
+    pub retry: RetryPolicy,
 }
 
 impl AppState {
     /// A backend client pointed at the configured backend, presenting the service
-    /// token on every call: reads need an identity too, and persisting a tournament
+    /// token on every call: reads need an identity too, and recording a tournament
     /// takes the service token.
-    fn backend(&self) -> HttpBackendClient {
+    pub fn backend(&self) -> HttpBackendClient {
         HttpBackendClient::new((*self.backend_url).clone())
             .with_token(self.backend_service_token.as_deref().cloned())
     }
@@ -81,6 +92,7 @@ impl AppState {
 fn routes() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/matches/controllers", get(controllers))
         .route("/matches", post(run_match_handler))
         .route("/tournaments", post(submit_tournament))
@@ -116,9 +128,23 @@ async fn accept_trace(request: axum::extract::Request, next: axum::middleware::N
     next.run(request).await
 }
 
-/// Liveness/readiness probe.
+/// Liveness probe: `200` while the process serves, shutting down included.
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Readiness probe: `503` once the arena is shutting down, so its endpoint leaves
+/// the `Service`.
+async fn readyz(State(state): State<AppState>) -> Response {
+    if state.shutdown.is_draining() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "shutting_down" })),
+        )
+            .into_response()
+    } else {
+        Json(serde_json::json!({ "status": "ok" })).into_response()
+    }
 }
 
 // --- Matches ----------------------------------------------------------------
@@ -130,6 +156,9 @@ async fn run_match_handler(
     State(state): State<AppState>,
     Json(body): Json<MatchBody>,
 ) -> Result<Json<MatchResponse>, ApiError> {
+    if state.shutdown.is_draining() {
+        return Err(ApiError::shutting_down());
+    }
     let client = state.backend();
     let test_case = client
         .resolve_version(&body.test_case, &body.version)
@@ -143,10 +172,10 @@ async fn run_match_handler(
 
     let red = resolve_controller(&client, &body.test_case, &body.version, &body.red)
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let blue = resolve_controller(&client, &body.test_case, &body.version, &body.blue)
         .await
-        .map_err(ApiError::bad_request)?;
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     // A match is CPU-bound wasm execution; run it off the async runtime under the
     // capacity guard (which rejects with `503` at capacity rather than queueing).
@@ -206,18 +235,33 @@ pub struct ControllersResponse {
 // --- Tournaments ------------------------------------------------------------
 
 /// `POST /tournaments` — submit a tournament. Resolves every participant's
-/// controller, acquires a capacity permit, registers a job, spawns the background
-/// task that runs all pairs and publishes the result, and returns the job id
-/// immediately (`202 Accepted`). At capacity the submit is rejected with `503`
-/// rather than queued, so the console sees the rejection.
+/// controller, acquires a capacity permit, records the tournament through the
+/// backend with every pairing as a match without a result, and only then answers
+/// `202 Accepted` and drives it in the background. At capacity, or while shutting
+/// down, the submit is rejected with `503` rather than queued, so the console sees
+/// the rejection.
 async fn submit_tournament(
     State(state): State<AppState>,
     Json(body): Json<TournamentBody>,
 ) -> Result<Response, ApiError> {
+    if state.shutdown.is_draining() {
+        return Err(ApiError::shutting_down());
+    }
     if body.participants.len() < 2 {
         return Err(ApiError::bad_request(
             "a tournament needs at least two participants",
         ));
+    }
+    let mut ids = HashSet::new();
+    if let Some(repeated) = body
+        .participants
+        .iter()
+        .find(|c| !ids.insert(c.id.as_str()))
+    {
+        return Err(ApiError::bad_request(format!(
+            "the field names controller `{}` more than once",
+            repeated.id
+        )));
     }
 
     let client = state.backend();
@@ -238,121 +282,110 @@ async fn submit_tournament(
         participants.push(
             resolve_controller(&client, &body.test_case, &body.version, controller)
                 .await
-                .map_err(ApiError::bad_request)?,
+                .map_err(|err| ApiError::bad_request(err.to_string()))?,
         );
     }
 
-    // Acquire the capacity permit before accepting the job: at capacity the submit
-    // is rejected with `503` so the console can retry, rather than queueing CPU-bound
-    // work the pod can't keep up with. The permit is held across the whole drive.
+    // Acquire the capacity permit before accepting the tournament: at capacity the
+    // submit is rejected with `503` so the console can retry, rather than queueing
+    // CPU-bound work the pod can't keep up with. The permit is held across the
+    // whole drive.
     let permit = state.executor.acquire()?;
 
-    let job = state.tournaments.create();
-    let job_id = job.id().to_string();
+    let id = cuid2::create_id();
     let variant = if body.variant.trim().is_empty() {
         "base".to_string()
     } else {
         body.variant
     };
+    let pending = PendingTournament {
+        id: id.clone(),
+        created_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|err| ApiError::internal(format!("formatting the time: {err}")))?,
+        test_case_slug: test_case.slug.clone(),
+        test_case_version: test_case.version.clone(),
+        variant,
+        participants: body.participants,
+        pairings: tournament_pairings(
+            &participants
+                .iter()
+                .map(|p| p.controller.clone())
+                .collect::<Vec<_>>(),
+        ),
+    };
 
-    let job_span = tracing::info_span!(
-        "tournament.job",
-        tournament_id = %job_id,
-        test_case = %body.test_case,
-        participants = participants.len(),
-    );
-    tokio::spawn(
-        drive_tournament(client, job, test_case, variant, participants, permit)
-            .instrument(job_span),
+    // Register before recording, so a resume listing the new tournament as queued
+    // finds it already driven here.
+    let live = state
+        .tournaments
+        .register(&id)
+        .ok_or_else(|| ApiError::internal(format!("tournament `{id}` is already driven")))?;
+    // The `202` promises the tournament outlives any restart, so it is answered
+    // only once the record is stored.
+    client
+        .record_pending_tournament(&pending)
+        .await
+        .map_err(|err| ApiError::backend_unavailable(format!("recording the tournament: {err}")))?;
+
+    let tournament = RecordedTournament {
+        record: TournamentRecord {
+            id: pending.id.clone(),
+            created_at: pending.created_at.clone(),
+            test_case_slug: pending.test_case_slug.clone(),
+            test_case_version: pending.test_case_version.clone(),
+            variant: pending.variant.clone(),
+            participants: pending.participants.clone(),
+            standings: Vec::new(),
+            matches: Vec::new(),
+        },
+        state: TournamentState::Queued,
+        detail: None,
+        pairings: pending.pairings,
+        published_at: pending.created_at,
+    };
+    spawn_drive(
+        state.clone(),
+        tournament,
+        live,
+        DriveStart::Accepted {
+            test_case: Box::new(test_case),
+            participants,
+            permit,
+        },
     );
 
     let ack = SubmitAck {
-        tournament_id: job_id.clone(),
-        status_url: format!("/tournaments/{job_id}"),
-        events_url: format!("/tournaments/{job_id}/events"),
+        tournament_id: id.clone(),
+        status_url: format!("/tournaments/{id}"),
+        events_url: format!("/tournaments/{id}/events"),
     };
     Ok((StatusCode::ACCEPTED, Json(ack)).into_response())
 }
 
-/// Run a tournament to completion and publish it, recording progress on `job`. Holds
-/// the capacity `permit` for the whole drive (dropped when this future returns).
-async fn drive_tournament(
-    client: HttpBackendClient,
-    job: TournamentJob,
-    test_case: test_cabinet_contracts::test_case::TestCaseVersion,
-    variant: String,
-    participants: Vec<ResolvedController>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    // Hold the permit until the tournament finishes (every pair plus publishing).
-    let _permit = permit;
-    let tournament_id = job.id().to_string();
-    let created_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_default();
-
-    // The matches are CPU-bound wasm execution; run them off the async runtime,
-    // pushing live progress as each pair completes.
-    let progress_job = job.clone();
-    let blocking_id = tournament_id.clone();
-    let build = tokio::task::spawn_blocking(move || {
-        run_tournament(
-            &test_case,
-            &variant,
-            &blocking_id,
-            &created_at,
-            participants,
-            |played, total, summary| {
-                progress_job.push_progress(TournamentProgress {
-                    played,
-                    total,
-                    summary: summary.clone(),
-                });
-            },
-        )
-    })
-    .await;
-
-    let build = match build {
-        Ok(Ok(build)) => build,
-        Ok(Err(err)) => return job.finish_failed(format!("running the tournament: {err}")),
-        Err(err) => return job.finish_failed(format!("tournament task panicked: {err}")),
-    };
-
-    // Publish the record and each match's replay to the backend (the gallery's
-    // store).
-    if let Err(err) = client.publish_tournament(&build.record).await {
-        return job.finish_failed(format!("publishing the tournament: {err}"));
-    }
-    for (match_id, replay) in &build.replays {
-        if let Err(err) = client
-            .publish_tournament_match(&tournament_id, match_id, replay.to_json().into_bytes())
-            .await
-        {
-            return job.finish_failed(format!("publishing match `{match_id}`: {err}"));
-        }
-    }
-
-    job.finish_succeeded(build.record);
-}
-
-/// `GET /tournaments/{job}` — the tournament job's current status (and the finished
-/// record once it has succeeded).
+/// `GET /tournaments/{id}` — the tournament's recorded status, and the finished
+/// record once it has succeeded.
 async fn tournament_status(
     State(state): State<AppState>,
-    Path(job): Path<String>,
-) -> Result<Json<TournamentJobStatus>, ApiError> {
-    let job = lookup(&state, &job)?;
-    Ok(Json(job.status()))
+    Path(id): Path<String>,
+) -> Result<Json<TournamentStatus>, ApiError> {
+    Ok(Json(recorded(&state, &id).await?.into()))
 }
 
-/// `GET /tournaments/{job}/events` — the live per-match progress stream as NDJSON.
+/// `GET /tournaments/{id}/events` — the recorded matches as a backlog, then each
+/// match as this process records it, as NDJSON. The stream ends with the backlog
+/// when the tournament is finished or this process is not driving it, and
+/// otherwise when the drive ends.
 async fn tournament_events(
     State(state): State<AppState>,
-    Path(job): Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let job = lookup(&state, &job)?;
-    let body = Body::from_stream(progress_stream(job));
+    // Subscribe before reading the record, so a match recorded in between is in
+    // one or the other; one in both is skipped from the live tail.
+    let receiver = state.tournaments.subscribe(&id);
+    let tournament = recorded(&state, &id).await?;
+    let receiver = receiver.filter(|_| !tournament.state.is_terminal());
+    let body = Body::from_stream(progress_stream(&tournament, receiver));
     Ok((
         [
             (header::CONTENT_TYPE, "application/x-ndjson"),
@@ -363,39 +396,56 @@ async fn tournament_events(
         .into_response())
 }
 
-/// Look up a tournament job by id, 404 if unknown.
-fn lookup(state: &AppState, id: &str) -> Result<TournamentJob, ApiError> {
+/// Read the backend's record of tournament `id`: `404` when it records none,
+/// `502` when it cannot be read.
+async fn recorded(state: &AppState, id: &str) -> Result<RecordedTournament, ApiError> {
     state
-        .tournaments
-        .get(id)
+        .backend()
+        .recorded_tournament(id)
+        .await
+        .map_err(|err| ApiError::backend_unavailable(format!("reading the tournament: {err}")))?
         .ok_or_else(|| ApiError::not_found(format!("tournament `{id}` not found")))
 }
 
-/// Build the NDJSON byte stream for a tournament: the replayed backlog of completed
-/// matches followed by the live tail, ending when the tournament does.
+/// Build the NDJSON byte stream for a tournament: its recorded matches as the
+/// backlog, followed by the live tail when there is one, ending when the drive
+/// does.
 fn progress_stream(
-    job: TournamentJob,
-) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> {
-    let sub = job.subscribe();
-    let backlog = stream::iter(sub.backlog.into_iter().map(|p| Ok(encode_line(&p))));
-    let live = stream::unfold(
-        (sub.terminated, sub.receiver),
-        |(done, mut receiver)| async move {
-            if done {
-                return None;
-            }
-            loop {
-                match receiver.recv().await {
-                    Ok(StreamItem::Progress(progress)) => {
-                        return Some((Ok(encode_line(&progress)), (false, receiver)));
+    tournament: &RecordedTournament,
+    receiver: Option<tokio::sync::broadcast::Receiver<StreamItem>>,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + use<> {
+    let total = tournament.pairings.len();
+    let backlog: Vec<TournamentProgress> = tournament
+        .record
+        .matches
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| TournamentProgress {
+            played: index + 1,
+            total,
+            summary: summary.clone(),
+        })
+        .collect();
+    let seen: HashSet<String> = backlog
+        .iter()
+        .map(|progress| progress.summary.match_id.clone())
+        .collect();
+    let backlog = stream::iter(backlog.into_iter().map(|p| Ok(encode_line(&p))));
+    let live = stream::unfold((receiver, seen), |(receiver, seen)| async move {
+        let mut receiver = receiver?;
+        loop {
+            match receiver.recv().await {
+                Ok(StreamItem::Progress(progress)) => {
+                    if seen.contains(&progress.summary.match_id) {
+                        continue;
                     }
-                    Ok(StreamItem::Done) => return None,
-                    Err(RecvError::Closed) => return None,
-                    Err(RecvError::Lagged(_)) => continue,
+                    return Some((Ok(encode_line(&progress)), (Some(receiver), seen)));
                 }
+                Ok(StreamItem::Done) | Err(RecvError::Closed) => return None,
+                Err(RecvError::Lagged(_)) => continue,
             }
-        },
-    );
+        }
+    });
     backlog.chain(live)
 }
 
@@ -425,7 +475,7 @@ pub struct TournamentBody {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitAck {
-    /// The id of the accepted tournament (also the persisted tournament's id).
+    /// The id of the accepted tournament (also the recorded tournament's id).
     pub tournament_id: String,
     /// Where to poll the tournament's status.
     pub status_url: String,

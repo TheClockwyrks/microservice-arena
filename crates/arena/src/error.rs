@@ -30,7 +30,8 @@ impl ApiError {
         }
     }
 
-    /// `404 Not Found` with code `not_found` — an unknown tournament job.
+    /// `404 Not Found` with code `not_found` — a tournament the backend does not
+    /// record.
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", message)
     }
@@ -61,6 +62,22 @@ impl ApiError {
     /// arena does not queue; the caller should retry later.
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "at_capacity", message)
+    }
+
+    /// `503 Service Unavailable` with code `shutting_down` — the arena received
+    /// `SIGTERM` and starts no new match or tournament.
+    pub fn shutting_down() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "the arena is shutting down and accepts no new match or tournament",
+        )
+    }
+
+    /// `502 Bad Gateway` with code `backend_unavailable` — the backend the arena
+    /// records and reads tournaments through refused or did not answer.
+    pub fn backend_unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, "backend_unavailable", message)
     }
 
     /// `500 Internal Server Error` with code `internal`.

@@ -11,7 +11,10 @@
 //!   when the match returns ([`run_match`](MatchExecutor::run_match)).
 //! - A **tournament** acquires one permit at submit time
 //!   ([`acquire`](MatchExecutor::acquire)) and holds it across its whole background
-//!   drive (every pair plus publishing), releasing it when the job finishes.
+//!   drive (every pair plus recording it), releasing it when the drive ends.
+//! - A tournament **resumed** after a restart queues for its permit
+//!   ([`acquire_queued`](MatchExecutor::acquire_queued)) rather than being
+//!   rejected, so a restart never runs more at once than the cap allows.
 
 use std::sync::Arc;
 
@@ -68,6 +71,12 @@ impl MatchExecutor {
     /// tournament finishes.
     pub fn acquire(&self) -> Result<OwnedSemaphorePermit, ApiError> {
         self.try_acquire()
+    }
+
+    /// Wait for a permit for a resumed tournament, queueing behind the work holding
+    /// them. `None` only if the semaphore is closed, which the executor never does.
+    pub async fn acquire_queued(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().acquire_owned().await.ok()
     }
 
     /// `try_acquire_owned`, mapping exhaustion onto the `503` envelope with a `warn`

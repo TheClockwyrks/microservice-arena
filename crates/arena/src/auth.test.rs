@@ -1,9 +1,9 @@
 //! The identity layer in front of the arena's routes, with and without an Access
 //! application configured, at the root and under the edge prefix.
 //!
-//! An unknown tournament's status is the probe route: it answers `404` to a caller
-//! the layer admitted without calling the backend, so a `401` can only be the
-//! layer's. The Access team's certificates are served by a local stand-in
+//! The controller listing is the probe route: it answers `200` to a caller the
+//! layer admitted, its backend unreachable contributing no pushed controller, so a
+//! `401` can only be the layer's. The Access team's certificates are served by a local stand-in
 //! ([`serve_certs`]), so nothing here leaves loopback.
 
 use std::sync::Arc;
@@ -19,24 +19,27 @@ use crate::access::tests::keys::{KEY_A, KEY_B, person_claims, service_claims};
 use crate::access::tests::serve_certs;
 use crate::access::{ASSERTION_HEADER, AccessVerifier};
 use crate::api::{AppState, router};
-use crate::executor::MatchExecutor;
-use crate::tournaments::TournamentRegistry;
 
 /// The audience tag a verifying arena checks for.
 const AUDIENCE: &str = "test-audience-tag";
 /// The shared control-plane service token every arena under test holds.
 const SERVICE_TOKEN: &str = "service-secret";
-/// A route an admitted caller reaches without the arena calling the backend.
-const ROUTES: [&str; 2] = ["/tournaments/no-such-job", "/arena/tournaments/no-such-job"];
+/// A route an admitted caller reaches whether or not the backend answers.
+const ROUTES: [&str; 2] = [
+    "/matches/controllers?testCase=pacman",
+    "/arena/matches/controllers?testCase=pacman",
+];
 
 /// An arena in `access` mode, its backend unreachable.
 fn arena(access: AccessMode) -> Router {
     router(AppState {
-        backend_url: Arc::new("http://127.0.0.1:0".to_string()),
-        backend_service_token: Some(Arc::new(SERVICE_TOKEN.to_string())),
-        tournaments: TournamentRegistry::new(),
-        executor: Arc::new(MatchExecutor::new(1)),
         access,
+        ..crate::stub_backend::arena_state(
+            "http://127.0.0.1:0",
+            1,
+            Some(SERVICE_TOKEN),
+            crate::drive::wasm_runner(),
+        )
     })
 }
 
@@ -135,7 +138,7 @@ async fn a_local_arena_takes_the_local_identity_header_and_ignores_an_assertion(
     assert_routes(
         &app,
         &[(LOCAL_IDENTITY_HEADER, "dev@local")],
-        StatusCode::NOT_FOUND,
+        StatusCode::OK,
     )
     .await;
     let assertion = KEY_A.sign(&person_claims("ada@example.com", AUDIENCE));
@@ -151,7 +154,7 @@ async fn a_local_arena_takes_the_local_identity_header_and_ignores_an_assertion(
 async fn the_service_token_is_an_identity_and_any_other_bearer_is_refused() {
     for app in [arena(None), verifying_arena().await] {
         let good = format!("Bearer {SERVICE_TOKEN}");
-        assert_routes(&app, &[("authorization", &good)], StatusCode::NOT_FOUND).await;
+        assert_routes(&app, &[("authorization", &good)], StatusCode::OK).await;
         // A bearer is resolved before the local identity header.
         assert_routes(
             &app,
@@ -169,9 +172,9 @@ async fn the_service_token_is_an_identity_and_any_other_bearer_is_refused() {
 async fn a_verified_assertion_is_an_identity() {
     let app = verifying_arena().await;
     let person = KEY_A.sign(&person_claims("ada@example.com", AUDIENCE));
-    assert_routes(&app, &[(ASSERTION_HEADER, &person)], StatusCode::NOT_FOUND).await;
+    assert_routes(&app, &[(ASSERTION_HEADER, &person)], StatusCode::OK).await;
     let service = KEY_A.sign(&service_claims("tcab-automation.access", AUDIENCE));
-    assert_routes(&app, &[(ASSERTION_HEADER, &service)], StatusCode::NOT_FOUND).await;
+    assert_routes(&app, &[(ASSERTION_HEADER, &service)], StatusCode::OK).await;
 }
 
 #[tokio::test]

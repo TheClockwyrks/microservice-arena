@@ -86,3 +86,18 @@ fn one_access_variable_alone_is_refused() {
         }
     }
 }
+
+#[test]
+fn the_shutdown_grace_defaults_to_fifty_seconds_and_reads_its_variable() {
+    use std::time::Duration;
+    assert_eq!(config(&[]).shutdown_grace, Duration::from_secs(50));
+    assert_eq!(
+        config(&[("TCAB_ARENA_SHUTDOWN_GRACE_SECONDS", "20")]).shutdown_grace,
+        Duration::from_secs(20)
+    );
+    assert_eq!(
+        config(&[("TCAB_ARENA_SHUTDOWN_GRACE_SECONDS", "soon")]).shutdown_grace,
+        Duration::from_secs(50),
+        "a value that is not whole seconds keeps the default"
+    );
+}

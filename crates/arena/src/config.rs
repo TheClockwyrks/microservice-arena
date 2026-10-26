@@ -5,9 +5,10 @@
 //! | Variable | Required | Purpose | Default |
 //! | --- | --- | --- | --- |
 //! | `TCAB_ARENA_BIND` | no | Address the Axum server binds. | `0.0.0.0:8791` |
-//! | `TCAB_BACKEND_URL` | no | The backend the service fetches controller inputs from and persists finished tournaments + replays back to. | `http://127.0.0.1:8787` |
-//! | `TCAB_BACKEND_SERVICE_TOKEN` | no | The shared service token the service presents on every backend call: every read needs an identity, and persisting a tournament takes the service token. Unset, the service presents none and the backend refuses its calls. | — |
+//! | `TCAB_BACKEND_URL` | no | The backend the service fetches controller inputs from and records every tournament, its matches and their replays through. | `http://127.0.0.1:8787` |
+//! | `TCAB_BACKEND_SERVICE_TOKEN` | no | The shared service token the service presents on every backend call: every read needs an identity, and recording a tournament takes the service token. Unset, the service presents none and the backend refuses its calls. | — |
 //! | `TCAB_ARENA_MAX_CONCURRENT` | no | The capacity guard: how many matches/tournaments may run their CPU-bound wasm concurrently before the service rejects with `503`. | `2` |
+//! | `TCAB_ARENA_SHUTDOWN_GRACE_SECONDS` | no | How long, after `SIGTERM`, the arena waits for the match each tournament is on to finish and be recorded before it exits. Shorter than the pod's `terminationGracePeriodSeconds`, so the arena exits before it is killed. | `50` |
 //! | `TCAB_ACCESS_TEAM_DOMAIN` | no | The Access team domain whose certificates sign the `Cf-Access-Jwt-Assertion` every edge request carries. Set together with `TCAB_ACCESS_AUDIENCE`. | — |
 //! | `TCAB_ACCESS_AUDIENCE` | no | The audience tag of the Access application protecting the arena's hostname. Set together with `TCAB_ACCESS_TEAM_DOMAIN`. | — |
 //!
@@ -22,6 +23,8 @@
 //! data-plane peer the edge's tunnel forwards the console's requests to over the
 //! cluster network, so it binds all interfaces.
 
+use std::time::Duration;
+
 /// The default address the Axum server binds when `TCAB_ARENA_BIND` is unset.
 /// Binds all interfaces so the edge's tunnel reaches it over the cluster network.
 const DEFAULT_BIND: &str = "0.0.0.0:8791";
@@ -33,6 +36,10 @@ const DEFAULT_BACKEND_URL: &str = "http://127.0.0.1:8787";
 /// semaphore when `TCAB_ARENA_MAX_CONCURRENT` is unset. Two CPU-bound runs at once
 /// is conservative headroom for a single dedicated arena pod.
 const DEFAULT_MAX_CONCURRENT: usize = 2;
+/// The default shutdown grace when `TCAB_ARENA_SHUTDOWN_GRACE_SECONDS` is unset:
+/// ten seconds inside the Deployment's `terminationGracePeriodSeconds` of `60`,
+/// which also covers its five-second `preStop` hook.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(50);
 
 pub use crate::access::AccessConfig;
 
@@ -44,8 +51,8 @@ pub struct Config {
     /// The backend base URL (`TCAB_BACKEND_URL`), without a trailing slash. The
     /// service fetches controller inputs from it (resolve a version, baseline
     /// `references/<id>.wasm`, a pushed run's `controller.wasm`, the pushed-controller
-    /// listing) and persists finished tournaments + replays back to it. The arena
-    /// holds no state of its own.
+    /// listing) and records every tournament, its matches and their replays through
+    /// it. The arena holds no state of its own.
     pub backend_url: String,
     /// The shared service token (`TCAB_BACKEND_SERVICE_TOKEN`) the service presents
     /// as `Authorization: Bearer` on every backend call, reads included, or `None`
@@ -57,6 +64,10 @@ pub struct Config {
     /// the service rejects with `503` rather than queueing, so a flood can't starve
     /// the pod.
     pub max_concurrent_matches: usize,
+    /// How long, after `SIGTERM`, the arena waits for each tournament's match in
+    /// progress to finish and be recorded before it exits
+    /// (`TCAB_ARENA_SHUTDOWN_GRACE_SECONDS`).
+    pub shutdown_grace: Duration,
     /// The Access application the arena verifies a request's assertion against
     /// (`TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE`), or `None` when neither
     /// is set and the arena takes the identity from the local identity header.
@@ -102,6 +113,10 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(DEFAULT_MAX_CONCURRENT),
+            shutdown_grace: var("TCAB_ARENA_SHUTDOWN_GRACE_SECONDS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE),
             access: access_config(var("TCAB_ACCESS_TEAM_DOMAIN"), var("TCAB_ACCESS_AUDIENCE"))?,
         })
     }
