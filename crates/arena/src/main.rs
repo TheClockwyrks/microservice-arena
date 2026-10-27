@@ -2,29 +2,52 @@
 //!
 //! Resolves configuration from the environment, builds the service, resumes the
 //! unfinished tournaments the backend records, and serves the Axum router until
-//! `SIGTERM`. Then it answers new work with `503`, waits within its grace for the
-//! match each tournament is on to finish and be recorded, and exits, abandoning a
-//! match still running (see [`test_cabinet_arena::shutdown`]). Every route but the
-//! health probes needs an
-//! identity: the Access assertion every request through the edge carries, verified
-//! against `TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE` (see
+//! it is told to stop. Every route but the two probes needs an identity: the
+//! Access assertion every request through the edge carries, verified against
+//! `TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE` (see
 //! [`test_cabinet_arena::auth`]). A configuration naming only one of the two
 //! `TCAB_ACCESS_*` variables is refused at startup.
+//!
+//! On `SIGTERM` it shuts down as [`test_cabinet_arena::shutdown`] describes and
+//! exits 0 within `TCAB_ARENA_SHUTDOWN_GRACE_SECONDS`; an interrupt (`Ctrl-C`)
+//! skips the drain delay.
 
-use std::future::IntoFuture as _;
 use std::process::ExitCode;
 
 use test_cabinet_arena::config::Config;
+use test_cabinet_arena::shutdown::DRAIN_DELAY;
+use tokio::sync::oneshot;
+use tokio::time::Instant;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("could not start the async runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(serve());
+    // A match still running past the shutdown grace runs on a blocking thread,
+    // which dropping the runtime would wait for; it is abandoned instead, and the
+    // next arena plays it again.
+    runtime.shutdown_background();
+    code
+}
+
+/// Serve the arena until it is told to stop, then shut it down.
+async fn serve() -> ExitCode {
     // Load `.env.arena` beside the project before anything reads the environment.
     // A missing file is fine (variables can be exported instead); `dotenvy` never
     // overrides already-set variables. This runs before telemetry init so any
     // `OTEL_*`/`TCAB_ENV` configured in the file is visible to it.
     let _ = dotenvy::from_filename(".env.arena");
 
-    let telemetry = match test_cabinet_telemetry::init(test_cabinet_telemetry::Config::new(
+    // Dropped when `serve` returns, which flushes the telemetry before the exit.
+    let _telemetry = match test_cabinet_telemetry::init(test_cabinet_telemetry::Config::new(
         "tcab-arena",
         env!("CARGO_PKG_VERSION"),
         "info,test_cabinet_arena=info",
@@ -46,12 +69,14 @@ async fn main() -> ExitCode {
     tracing::info!(
         backend = %config.backend_url,
         max_concurrent = config.max_concurrent_matches,
+        shutdown_grace_secs = config.shutdown_grace.as_secs(),
         verifies_access = config.access.is_some(),
         "arena service configuration resolved"
     );
 
     let service = test_cabinet_arena::build(config);
     let state = service.state.clone();
+    let grace = service.shutdown_grace;
 
     let listener = match tokio::net::TcpListener::bind(&service.bind).await {
         Ok(listener) => listener,
@@ -67,74 +92,104 @@ async fn main() -> ExitCode {
     // listed.
     tokio::spawn(test_cabinet_arena::drive::resume_unfinished(state.clone()));
 
-    // The listener stays open while the drives finish, so new work meets a `503`
-    // rather than a refused connection; it closes once the last drive ends.
-    let shutdown = state.shutdown.clone();
-    let drives = state.drives.clone();
-    let mut server = tokio::spawn(
-        axum::serve(listener, service.router)
-            .with_graceful_shutdown(async move {
-                shutdown.draining().await;
-                drives.idle().await;
-            })
-            .into_future(),
-    );
-    tokio::select! {
-        () = terminated() => {}
-        served = &mut server => {
-            // The server ended with no signal, which only a failure does.
-            match served {
-                Ok(Ok(())) => eprintln!("server stopped"),
-                Ok(Err(err)) => eprintln!("server error: {err}"),
-                Err(err) => eprintln!("server task failed: {err}"),
+    // The moment the stop was requested, from which the shutdown grace runs.
+    let (signalled_tx, signalled_rx) = oneshot::channel::<Instant>();
+    let shutdown = {
+        let state = state.clone();
+        async move {
+            let stop = stop_requested().await;
+            let _ = signalled_tx.send(Instant::now());
+            state.shutdown.begin();
+            tracing::info!(
+                drives = state.drives.active(),
+                "stopping: readiness fails, new work is refused, and each tournament \
+                 stops once the match it is on is recorded"
+            );
+            if stop == Stop::Terminate {
+                tracing::info!(
+                    delay_secs = DRAIN_DELAY.as_secs(),
+                    "accepting through the drain delay"
+                );
+                tokio::time::sleep(DRAIN_DELAY).await;
+            } else {
+                tracing::info!("interrupted: skipping the drain delay");
             }
-            return ExitCode::FAILURE;
+            tracing::info!("no longer accepting; finishing the work in flight");
         }
-    }
+    };
 
-    tracing::info!(
-        drives = state.drives.active(),
-        grace_seconds = service.shutdown_grace.as_secs(),
-        "shutting down: finishing the match each tournament is on"
-    );
-    state.shutdown.begin();
-    let drained = tokio::time::timeout(service.shutdown_grace, async {
-        state.drives.idle().await;
-        let _ = server.await;
-    })
-    .await;
-    if drained.is_err() {
-        tracing::warn!(
-            drives = state.drives.active(),
-            "the shutdown grace ended; the matches still running are abandoned unrecorded"
-        );
-    }
-    // A match still running holds a blocking thread the runtime's drop would wait
-    // for, so the process exits without dropping it, flushing telemetry first.
-    drop(telemetry);
-    std::process::exit(0);
-}
+    let drives = state.drives.clone();
+    let stopped = async move {
+        axum::serve(listener, service.router)
+            .with_graceful_shutdown(shutdown)
+            .await?;
+        // Every request has finished; a tournament may still be recording the
+        // match it is on.
+        drives.idle().await;
+        Ok::<(), std::io::Error>(())
+    };
+    let deadline = async move {
+        match signalled_rx.await {
+            Ok(signalled) => tokio::time::sleep_until(signalled + grace).await,
+            // The server ended without a stop being requested: only its own result
+            // decides.
+            Err(_) => std::future::pending().await,
+        }
+    };
 
-/// Resolve on `SIGTERM` or Ctrl-C.
-async fn terminated() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = sigterm.recv() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
+    tokio::select! {
+        result = stopped => match result {
+            Ok(()) => {
+                tracing::info!("arena stopped");
+                ExitCode::SUCCESS
             }
             Err(err) => {
-                eprintln!("could not listen for SIGTERM: {err}");
-                let _ = tokio::signal::ctrl_c().await;
+                eprintln!("server error: {err}");
+                ExitCode::FAILURE
             }
+        },
+        () = deadline => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                drives = state.drives.active(),
+                "the shutdown grace ended; the matches still running are abandoned unrecorded"
+            );
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// What stopped the arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// `SIGTERM`, which Kubernetes sends a pod it stops: drain in full.
+    Terminate,
+    /// An interrupt (`Ctrl-C`) at a terminal: skip the drain delay.
+    Interrupt,
+}
+
+/// Resolve on `SIGTERM` or on an interrupt, naming which.
+async fn stop_requested() -> Stop {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(terminate) => terminate,
+                Err(err) => {
+                    tracing::warn!("cannot listen for SIGTERM ({err}); stopping on Ctrl-C only");
+                    let _ = interrupt.await;
+                    return Stop::Interrupt;
+                }
+            };
+        tokio::select! {
+            _ = interrupt => Stop::Interrupt,
+            _ = terminate.recv() => Stop::Terminate,
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = interrupt.await;
+        Stop::Interrupt
     }
 }

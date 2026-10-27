@@ -564,6 +564,72 @@ async fn the_event_stream_replays_the_recorded_matches_then_tails_the_rest() {
 }
 
 #[tokio::test]
+async fn a_shutdown_ends_the_live_stream_and_the_drive_records_its_match_in_progress() {
+    let backend = Backend::default();
+    let url = spawn_stub_backend_with(backend.clone()).await;
+    // Hold the tournament before its third match until the test releases it.
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let reached_tx = Arc::new(std::sync::Mutex::new(reached_tx));
+    let runner = ScriptedRunner {
+        hook: Some(Arc::new(move |count, _| {
+            if count == 2 {
+                reached_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        })),
+        ..ScriptedRunner::default()
+    };
+    let state = arena(&url, 2, &runner);
+    let app = router(&state);
+    let id = submit_field(&app).await;
+    tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+        .await
+        .unwrap();
+    eventually("the two matches recorded", || {
+        backend.lock().unwrap().tournaments[&id]
+            .record
+            .matches
+            .len()
+            == 2
+    })
+    .await;
+
+    // The stream answers the backlog, then waits on the live tail.
+    let response = send(&app, "GET", &format!("/tournaments/{id}/events"), None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut text = String::new();
+    while text.lines().count() < 2 {
+        let chunk = body.next().await.unwrap().unwrap();
+        text.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+
+    // Shutdown ends the stream while the third match is still being played.
+    state.shutdown.begin();
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut rest = String::new();
+        while let Some(chunk) = body.next().await {
+            rest.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+        rest
+    })
+    .await
+    .expect("the stream ends once shutdown begins");
+    assert!(rest.is_empty(), "nothing after the backlog: {rest}");
+
+    // The match in progress is recorded, and no other starts.
+    release_tx.send(()).unwrap();
+    state.drives.idle().await;
+    assert_eq!(runner.played().len(), 3);
+    let backend = backend.lock().unwrap();
+    let tournament = &backend.tournaments[&id];
+    assert_eq!(tournament.state, TournamentState::Running);
+    assert_eq!(tournament.record.matches.len(), 3);
+}
+
+#[tokio::test]
 async fn an_unknown_tournament_is_not_found() {
     let backend = Backend::default();
     let url = spawn_stub_backend_with(backend).await;

@@ -30,8 +30,9 @@
 //!   completes, its standings at the end, and resuming the unfinished ones.
 //! - [`tournaments`] — the tournaments this process drives and their live NDJSON
 //!   progress channels. Per-pod, so the Deployment runs a single replica.
-//! - [`shutdown`] — `SIGTERM`: no new work, the match in progress recorded within
-//!   the grace, then exit.
+//! - [`shutdown`] — `SIGTERM`: readiness fails, new work is refused and live
+//!   streams end, the server accepts through a drain delay, and each tournament
+//!   records the match it is on within the grace before the process exits.
 //! - [`executor`] — the capacity guard: a semaphore bounding concurrent CPU-bound
 //!   work, rejecting with `503` (not queueing) at capacity.
 //! - [`auth`] — who is calling: the Access assertion every request through the edge
@@ -77,7 +78,8 @@ pub struct ArenaService {
     /// The shared state: [`drive::resume_unfinished`] runs over it, and its
     /// [`Shutdown`] and [`Drives`] are what the binary drains on `SIGTERM`.
     pub state: AppState,
-    /// How long a shutdown waits for the drives before the process exits.
+    /// How long after the stop signal the process exits at the latest, whatever
+    /// still runs (`TCAB_ARENA_SHUTDOWN_GRACE_SECONDS`).
     pub shutdown_grace: std::time::Duration,
 }
 

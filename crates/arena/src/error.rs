@@ -64,13 +64,14 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "at_capacity", message)
     }
 
-    /// `503 Service Unavailable` with code `shutting_down` — the arena received
-    /// `SIGTERM` and starts no new match or tournament.
-    pub fn shutting_down() -> Self {
+    /// `503 Service Unavailable` with code `stopping` — the arena was told to stop
+    /// and starts no new match or tournament; the caller retries against the arena
+    /// that replaces it.
+    pub fn stopping() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "shutting_down",
-            "the arena is shutting down and accepts no new match or tournament",
+            "stopping",
+            "the arena is stopping and accepts no new match or tournament; retry shortly",
         )
     }
 

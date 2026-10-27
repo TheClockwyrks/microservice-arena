@@ -24,6 +24,16 @@ async fn a_waiter_wakes_when_shutdown_begins() {
         .expect("already draining");
 }
 
+#[test]
+fn shutdown_latches_for_every_clone() {
+    let shutdown = Shutdown::new();
+    let clone = shutdown.clone();
+    clone.begin();
+    assert!(shutdown.is_draining());
+    clone.begin();
+    assert!(shutdown.is_draining());
+}
+
 #[tokio::test]
 async fn the_drives_are_idle_once_every_guard_drops() {
     let drives = Drives::new();

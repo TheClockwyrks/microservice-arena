@@ -8,7 +8,7 @@
 //! | `TCAB_BACKEND_URL` | no | The backend the service fetches controller inputs from and records every tournament, its matches and their replays through. | `http://127.0.0.1:8787` |
 //! | `TCAB_BACKEND_SERVICE_TOKEN` | no | The shared service token the service presents on every backend call: every read needs an identity, and recording a tournament takes the service token. Unset, the service presents none and the backend refuses its calls. | — |
 //! | `TCAB_ARENA_MAX_CONCURRENT` | no | The capacity guard: how many matches/tournaments may run their CPU-bound wasm concurrently before the service rejects with `503`. | `2` |
-//! | `TCAB_ARENA_SHUTDOWN_GRACE_SECONDS` | no | How long, after `SIGTERM`, the arena waits for the match each tournament is on to finish and be recorded before it exits. Shorter than the pod's `terminationGracePeriodSeconds`, so the arena exits before it is killed. | `50` |
+//! | `TCAB_ARENA_SHUTDOWN_GRACE_SECONDS` | no | How long after `SIGTERM` the arena exits at the latest: the drain delay, the requests in flight and the match each tournament is on finish and are recorded within it, and whatever still runs then is abandoned. Shorter than the pod's `terminationGracePeriodSeconds`, so the arena exits before it is killed. | `50` |
 //! | `TCAB_ACCESS_TEAM_DOMAIN` | no | The Access team domain whose certificates sign the `Cf-Access-Jwt-Assertion` every edge request carries. Set together with `TCAB_ACCESS_AUDIENCE`. | — |
 //! | `TCAB_ACCESS_AUDIENCE` | no | The audience tag of the Access application protecting the arena's hostname. Set together with `TCAB_ACCESS_TEAM_DOMAIN`. | — |
 //!
@@ -64,9 +64,9 @@ pub struct Config {
     /// the service rejects with `503` rather than queueing, so a flood can't starve
     /// the pod.
     pub max_concurrent_matches: usize,
-    /// How long, after `SIGTERM`, the arena waits for each tournament's match in
-    /// progress to finish and be recorded before it exits
-    /// (`TCAB_ARENA_SHUTDOWN_GRACE_SECONDS`).
+    /// How long after `SIGTERM` the arena exits at the latest, waiting meanwhile
+    /// for the requests in flight and for each tournament's match in progress to
+    /// finish and be recorded (`TCAB_ARENA_SHUTDOWN_GRACE_SECONDS`).
     pub shutdown_grace: Duration,
     /// The Access application the arena verifies a request's assertion against
     /// (`TCAB_ACCESS_TEAM_DOMAIN` and `TCAB_ACCESS_AUDIENCE`), or `None` when neither

@@ -8,12 +8,17 @@
 //! answer the same from any arena process (the arena overview's "Durable
 //! tournaments").
 //!
-//! Every route but the health probe needs an identity, resolved by
+//! Every route but the two probes needs an identity, resolved by
 //! [`crate::auth::identify`]: the Access assertion every request through the edge
 //! carries, verified as the backend verifies it. Every route is served at the root
 //! and under the edge's [`/arena`](crate::auth::EDGE_PREFIX) prefix, which
 //! `cloudflared` forwards unchanged. The CPU-bound wasm execution behind the routes
 //! is bounded by the [`MatchExecutor`] capacity guard.
+//!
+//! `/healthz` is liveness and `/readyz` readiness; they stay apart, since a
+//! stopping arena is alive but not ready. Once shutdown begins ([`crate::shutdown`]),
+//! `/readyz` answers `503`, a new match or tournament is refused with `503`, and
+//! the live tail of every progress stream ends.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -45,7 +50,7 @@ use crate::auth::{AccessMode, EDGE_PREFIX};
 use crate::drive::{DriveStart, RetryPolicy, TournamentRunner, spawn_drive};
 use crate::error::ApiError;
 use crate::executor::MatchExecutor;
-use crate::shutdown::{Drives, Shutdown};
+use crate::shutdown::{Drives, Shutdown, refuse_new_work};
 use crate::tournaments::{StreamItem, TournamentProgress, TournamentRegistry, TournamentStatus};
 
 /// The shared handler state: the backend URL the service fetches inputs from and
@@ -67,7 +72,8 @@ pub struct AppState {
     /// The Access verifier a request's assertion is checked with, or `None` when
     /// the arena takes a person's identity from the local identity header.
     pub access: AccessMode,
-    /// Begun on `SIGTERM`: no new match or tournament starts.
+    /// Begun on `SIGTERM`: readiness fails, live streams end, no new match or
+    /// tournament starts and every tournament stops after its match in progress.
     pub shutdown: Shutdown,
     /// The tournament drives under way, which a shutdown waits for.
     pub drives: Drives,
@@ -88,14 +94,16 @@ impl AppState {
 }
 
 /// Every route of the arena, served by [`router`] at the root and under the edge
-/// prefix.
-fn routes() -> Router<AppState> {
+/// prefix. The two routes that start CPU-bound work refuse it once shutdown has
+/// begun.
+fn routes(state: &AppState) -> Router<AppState> {
+    let refuse = || axum::middleware::from_fn_with_state(state.clone(), refuse_new_work);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/matches/controllers", get(controllers))
-        .route("/matches", post(run_match_handler))
-        .route("/tournaments", post(submit_tournament))
+        .route("/matches", post(run_match_handler).layer(refuse()))
+        .route("/tournaments", post(submit_tournament).layer(refuse()))
         .route("/tournaments/{id}", get(tournament_status))
         .route("/tournaments/{id}/events", get(tournament_events))
 }
@@ -107,8 +115,8 @@ fn routes() -> Router<AppState> {
 /// services.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .merge(routes())
-        .nest(EDGE_PREFIX, routes())
+        .merge(routes(&state))
+        .nest(EDGE_PREFIX, routes(&state))
         // Innermost, so the trace layer records a refused request, and inside CORS,
         // so a browser's preflight (which carries no credential) is answered by it.
         .layer(axum::middleware::from_fn_with_state(
@@ -128,22 +136,23 @@ async fn accept_trace(request: axum::extract::Request, next: axum::middleware::N
     next.run(request).await
 }
 
-/// Liveness probe: `200` while the process serves, shutting down included.
+/// Liveness probe: the process is up and serving. It stays `200` while the arena
+/// stops, so the kubelet never restarts a pod that is finishing its work.
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// Readiness probe: `503` once the arena is shutting down, so its endpoint leaves
-/// the `Service`.
+/// Readiness probe: `200` until the arena is told to stop, then `503`, so its
+/// endpoint leaves the `Service` while it finishes the work in flight.
 async fn readyz(State(state): State<AppState>) -> Response {
     if state.shutdown.is_draining() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "shutting_down" })),
+            Json(serde_json::json!({ "status": "draining" })),
         )
             .into_response()
     } else {
-        Json(serde_json::json!({ "status": "ok" })).into_response()
+        Json(serde_json::json!({ "status": "ready" })).into_response()
     }
 }
 
@@ -156,9 +165,6 @@ async fn run_match_handler(
     State(state): State<AppState>,
     Json(body): Json<MatchBody>,
 ) -> Result<Json<MatchResponse>, ApiError> {
-    if state.shutdown.is_draining() {
-        return Err(ApiError::shutting_down());
-    }
     let client = state.backend();
     let test_case = client
         .resolve_version(&body.test_case, &body.version)
@@ -237,16 +243,13 @@ pub struct ControllersResponse {
 /// `POST /tournaments` — submit a tournament. Resolves every participant's
 /// controller, acquires a capacity permit, records the tournament through the
 /// backend with every pairing as a match without a result, and only then answers
-/// `202 Accepted` and drives it in the background. At capacity, or while shutting
-/// down, the submit is rejected with `503` rather than queued, so the console sees
-/// the rejection.
+/// `202 Accepted` and drives it in the background. At capacity the submit is
+/// rejected with `503` rather than queued, so the console sees the rejection; once
+/// shutdown has begun, [`refuse_new_work`] refuses it before it is read.
 async fn submit_tournament(
     State(state): State<AppState>,
     Json(body): Json<TournamentBody>,
 ) -> Result<Response, ApiError> {
-    if state.shutdown.is_draining() {
-        return Err(ApiError::shutting_down());
-    }
     if body.participants.len() < 2 {
         return Err(ApiError::bad_request(
             "a tournament needs at least two participants",
@@ -375,7 +378,8 @@ async fn tournament_status(
 /// `GET /tournaments/{id}/events` — the recorded matches as a backlog, then each
 /// match as this process records it, as NDJSON. The stream ends with the backlog
 /// when the tournament is finished or this process is not driving it, and
-/// otherwise when the drive ends.
+/// otherwise when the drive ends or the arena begins shutting down, so its client
+/// reconnects to the arena that replaces this one.
 async fn tournament_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -385,7 +389,11 @@ async fn tournament_events(
     let receiver = state.tournaments.subscribe(&id);
     let tournament = recorded(&state, &id).await?;
     let receiver = receiver.filter(|_| !tournament.state.is_terminal());
-    let body = Body::from_stream(progress_stream(&tournament, receiver));
+    let body = Body::from_stream(progress_stream(
+        &tournament,
+        receiver,
+        state.shutdown.draining(),
+    ));
     Ok((
         [
             (header::CONTENT_TYPE, "application/x-ndjson"),
@@ -409,11 +417,15 @@ async fn recorded(state: &AppState, id: &str) -> Result<RecordedTournament, ApiE
 
 /// Build the NDJSON byte stream for a tournament: its recorded matches as the
 /// backlog, followed by the live tail when there is one, ending when the drive
-/// does.
-fn progress_stream(
+/// does or `stop` resolves.
+fn progress_stream<S>(
     tournament: &RecordedTournament,
     receiver: Option<tokio::sync::broadcast::Receiver<StreamItem>>,
-) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + use<> {
+    stop: S,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + use<S>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
     let total = tournament.pairings.len();
     let backlog: Vec<TournamentProgress> = tournament
         .record
@@ -446,7 +458,7 @@ fn progress_stream(
             }
         }
     });
-    backlog.chain(live)
+    backlog.chain(live.take_until(stop))
 }
 
 /// Encode one progress item as a `\n`-terminated NDJSON line. A progress item's
@@ -486,3 +498,7 @@ pub struct SubmitAck {
 #[cfg(test)]
 #[path = "api.test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "api.shutdown.test.rs"]
+mod shutdown_tests;
