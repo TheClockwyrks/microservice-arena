@@ -106,11 +106,11 @@ opt-level = 3
 # never names an Azure URL or a path outside the repository: the
 # dependency-edges gate refuses both.
 [workspace.dependencies]
-test-cabinet-contracts = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
-test-cabinet-backend-client = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
-test-cabinet-telemetry = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.3" }
-test-cabinet-match-play = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.2" }
-foray-core = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.2" }
+test-cabinet-contracts = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.5" }
+test-cabinet-backend-client = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.5" }
+test-cabinet-telemetry = { git = "https://github.com/TheClockwyrks/contracts", tag = "v0.2.5" }
+test-cabinet-match-play = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.5" }
+foray-core = { git = "https://github.com/TheClockwyrks/engines", tag = "v1.1.5" }
 
 # The third-party crates the members share, at the requirements the superrepo
 # holds the same crates to, so a service resolves the versions its peers do.

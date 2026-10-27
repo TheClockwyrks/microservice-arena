@@ -743,7 +743,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "foray-core"
 version = "0.0.0"
-source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.2#d3bb97ccd21640681616a9e29a9e0b6ff045cde7"
+source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.5#ae34fba1bae50662ecbbca8eb0cbcf52aa381e52"
 dependencies = [
  "schemars",
  "serde",
@@ -754,7 +754,7 @@ dependencies = [
 [[package]]
 name = "foray-host"
 version = "0.0.0"
-source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.2#d3bb97ccd21640681616a9e29a9e0b6ff045cde7"
+source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.5#ae34fba1bae50662ecbbca8eb0cbcf52aa381e52"
 dependencies = [
  "foray-core",
  "serde_json",
@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "lattice-core"
 version = "0.0.0"
-source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.2#d3bb97ccd21640681616a9e29a9e0b6ff045cde7"
+source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.5#ae34fba1bae50662ecbbca8eb0cbcf52aa381e52"
 dependencies = [
  "schemars",
  "serde",
@@ -1272,7 +1272,7 @@ dependencies = [
 [[package]]
 name = "lattice-host"
 version = "0.0.0"
-source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.2#d3bb97ccd21640681616a9e29a9e0b6ff045cde7"
+source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.5#ae34fba1bae50662ecbbca8eb0cbcf52aa381e52"
 dependencies = [
  "lattice-core",
  "serde_json",
@@ -2585,8 +2585,8 @@ dependencies = [
 
 [[package]]
 name = "test-cabinet-backend-client"
-version = "0.2.3"
-source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.3#436608c302ced17da63e07a7f8539c159c5bede7"
+version = "0.2.5"
+source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.5#a739fb0d6874f9ba80ba1ae7d811ca1850c4dc57"
 dependencies = [
  "async-trait",
  "http",
@@ -2601,8 +2601,8 @@ dependencies = [
 
 [[package]]
 name = "test-cabinet-contracts"
-version = "0.2.3"
-source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.3#436608c302ced17da63e07a7f8539c159c5bede7"
+version = "0.2.5"
+source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.5#a739fb0d6874f9ba80ba1ae7d811ca1850c4dc57"
 dependencies = [
  "hex",
  "percent-encoding",
@@ -2618,7 +2618,7 @@ dependencies = [
 [[package]]
 name = "test-cabinet-match-play"
 version = "0.0.0"
-source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.2#d3bb97ccd21640681616a9e29a9e0b6ff045cde7"
+source = "git+https://github.com/TheClockwyrks/engines?tag=v1.1.5#ae34fba1bae50662ecbbca8eb0cbcf52aa381e52"
 dependencies = [
  "foray-core",
  "foray-host",
@@ -2631,8 +2631,8 @@ dependencies = [
 
 [[package]]
 name = "test-cabinet-telemetry"
-version = "0.2.3"
-source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.3#436608c302ced17da63e07a7f8539c159c5bede7"
+version = "0.2.5"
+source = "git+https://github.com/TheClockwyrks/contracts?tag=v0.2.5#a739fb0d6874f9ba80ba1ae7d811ca1850c4dc57"
 dependencies = [
  "anyhow",
  "http",
