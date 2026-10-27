@@ -17,8 +17,8 @@
 //!
 //! `/healthz` is liveness and `/readyz` readiness; they stay apart, since a
 //! stopping arena is alive but not ready. Once shutdown begins ([`crate::shutdown`]),
-//! `/readyz` answers `503`, a new match or tournament is refused with `503`, and
-//! the live tail of every progress stream ends.
+//! `/readyz` answers `503` and the live tail of every progress stream ends; once
+//! its drain delay ends, a new match or tournament is refused with `503`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -50,7 +50,7 @@ use crate::auth::{AccessMode, EDGE_PREFIX};
 use crate::drive::{DriveStart, RetryPolicy, TournamentRunner, spawn_drive};
 use crate::error::ApiError;
 use crate::executor::MatchExecutor;
-use crate::shutdown::{Drives, Shutdown, refuse_new_work};
+use crate::shutdown::{Drives, Shutdown, refuse_new_work, stamp_arrival};
 use crate::tournaments::{StreamItem, TournamentProgress, TournamentRegistry, TournamentStatus};
 
 /// The shared handler state: the backend URL the service fetches inputs from and
@@ -72,8 +72,9 @@ pub struct AppState {
     /// The Access verifier a request's assertion is checked with, or `None` when
     /// the arena takes a person's identity from the local identity header.
     pub access: AccessMode,
-    /// Begun on `SIGTERM`: readiness fails, live streams end, no new match or
-    /// tournament starts and every tournament stops after its match in progress.
+    /// Begun on `SIGTERM`: readiness fails, live streams end and every tournament
+    /// stops after its match in progress; once the drain delay ends, no new match
+    /// or tournament starts.
     pub shutdown: Shutdown,
     /// The tournament drives under way, which a shutdown waits for.
     pub drives: Drives,
@@ -94,8 +95,8 @@ impl AppState {
 }
 
 /// Every route of the arena, served by [`router`] at the root and under the edge
-/// prefix. The two routes that start CPU-bound work refuse it once shutdown has
-/// begun.
+/// prefix. The two routes that start CPU-bound work refuse it once the arena's
+/// drain delay has ended.
 fn routes(state: &AppState) -> Router<AppState> {
     let refuse = || axum::middleware::from_fn_with_state(state.clone(), refuse_new_work);
     Router::new()
@@ -126,6 +127,12 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(accept_trace))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive().allow_headers(AllowHeaders::mirror_request()))
+        // Outermost, so whether a request is refused while the arena stops is
+        // decided by when it arrived, not by how long the identity check took.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            stamp_arrival,
+        ))
         .with_state(state)
 }
 
@@ -245,7 +252,9 @@ pub struct ControllersResponse {
 /// backend with every pairing as a match without a result, and only then answers
 /// `202 Accepted` and drives it in the background. At capacity the submit is
 /// rejected with `503` rather than queued, so the console sees the rejection; once
-/// shutdown has begun, [`refuse_new_work`] refuses it before it is read.
+/// the drain delay has ended, [`refuse_new_work`] refuses it before it is read. One
+/// accepted while the arena drains is recorded and left queued, for the arena that
+/// replaces this one to resume.
 async fn submit_tournament(
     State(state): State<AppState>,
     Json(body): Json<TournamentBody>,

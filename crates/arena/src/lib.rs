@@ -30,9 +30,9 @@
 //!   completes, its standings at the end, and resuming the unfinished ones.
 //! - [`tournaments`] — the tournaments this process drives and their live NDJSON
 //!   progress channels. Per-pod, so the Deployment runs a single replica.
-//! - [`shutdown`] — `SIGTERM`: readiness fails, new work is refused and live
-//!   streams end, the server accepts through a drain delay, and each tournament
-//!   records the match it is on within the grace before the process exits.
+//! - [`shutdown`] — `SIGTERM`: readiness fails, live streams end and each
+//!   tournament records the match it is on, new work is served through a drain
+//!   delay and refused after it, and the process exits within the grace.
 //! - [`executor`] — the capacity guard: a semaphore bounding concurrent CPU-bound
 //!   work, rejecting with `503` (not queueing) at capacity.
 //! - [`auth`] — who is calling: the Access assertion every request through the edge

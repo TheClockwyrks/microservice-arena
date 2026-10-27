@@ -15,7 +15,7 @@
 use std::process::ExitCode;
 
 use test_cabinet_arena::config::Config;
-use test_cabinet_arena::shutdown::DRAIN_DELAY;
+use test_cabinet_arena::shutdown::{DRAIN_DELAY, Stop, stop_signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -40,6 +40,16 @@ fn main() -> ExitCode {
 
 /// Serve the arena until it is told to stop, then shut it down.
 async fn serve() -> ExitCode {
+    // First, so a stop requested while the arena starts is held for the drain
+    // rather than killing the process.
+    let stop_requested = match stop_signal() {
+        Ok(stop_requested) => stop_requested,
+        Err(err) => {
+            eprintln!("could not listen for SIGTERM and the interrupt: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Load `.env.arena` beside the project before anything reads the environment.
     // A missing file is fine (variables can be exported instead); `dotenvy` never
     // overrides already-set variables. This runs before telemetry init so any
@@ -97,23 +107,24 @@ async fn serve() -> ExitCode {
     let shutdown = {
         let state = state.clone();
         async move {
-            let stop = stop_requested().await;
+            let stop = stop_requested.await;
             let _ = signalled_tx.send(Instant::now());
             state.shutdown.begin();
             tracing::info!(
                 drives = state.drives.active(),
-                "stopping: readiness fails, new work is refused, and each tournament \
-                 stops once the match it is on is recorded"
+                "stopping: readiness fails, and each tournament stops once the match \
+                 it is on is recorded"
             );
             if stop == Stop::Terminate {
                 tracing::info!(
                     delay_secs = DRAIN_DELAY.as_secs(),
-                    "accepting through the drain delay"
+                    "serving through the drain delay"
                 );
                 tokio::time::sleep(DRAIN_DELAY).await;
             } else {
                 tracing::info!("interrupted: skipping the drain delay");
             }
+            state.shutdown.refuse();
             tracing::info!("no longer accepting; finishing the work in flight");
         }
     };
@@ -156,40 +167,5 @@ async fn serve() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-    }
-}
-
-/// What stopped the arena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stop {
-    /// `SIGTERM`, which Kubernetes sends a pod it stops: drain in full.
-    Terminate,
-    /// An interrupt (`Ctrl-C`) at a terminal: skip the drain delay.
-    Interrupt,
-}
-
-/// Resolve on `SIGTERM` or on an interrupt, naming which.
-async fn stop_requested() -> Stop {
-    let interrupt = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(terminate) => terminate,
-                Err(err) => {
-                    tracing::warn!("cannot listen for SIGTERM ({err}); stopping on Ctrl-C only");
-                    let _ = interrupt.await;
-                    return Stop::Interrupt;
-                }
-            };
-        tokio::select! {
-            _ = interrupt => Stop::Interrupt,
-            _ = terminate.recv() => Stop::Terminate,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = interrupt.await;
-        Stop::Interrupt
     }
 }

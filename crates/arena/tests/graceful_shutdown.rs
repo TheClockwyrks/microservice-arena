@@ -1,7 +1,7 @@
 //! The real `tcab-arena` process drains on `SIGTERM`: readiness answers `503`
-//! through the drain delay while a slow request is in flight, a new match is
-//! refused, the server then stops accepting, the request still completes, and the
-//! process exits 0. An interrupt stops it with status 0 too.
+//! through the drain delay while a slow request is in flight and a new match is
+//! still served, the server then stops accepting, the request still completes, and
+//! the process exits 0. An interrupt stops it with status 0 too.
 //!
 //! The slow request is `GET /matches/controllers`, which asks the backend for the
 //! case's pushed controllers. The backend here is a stub that holds that answer
@@ -138,26 +138,33 @@ async fn spawn_stub_backend(release: Arc<Notify>) -> (String, mpsc::UnboundedRec
     (format!("http://{addr}"), arrived_rx)
 }
 
-/// Poll `GET path` on fresh connections until `done` accepts the outcome (a status,
-/// or `None` for a connection the arena refused), failing past [`BOUND`].
-async fn poll_until(
-    arena: &Arena,
-    path: &str,
-    what: &str,
-    done: impl Fn(Option<reqwest::StatusCode>) -> bool,
-) {
+/// What one readiness probe on a fresh connection found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// An answer with this status.
+    Status(u16),
+    /// No answer: nothing accepts on the port, or a connection accepted or queued
+    /// just as the listener closed was reset or closed.
+    Refused,
+}
+
+async fn probe(client: &reqwest::Client, arena: &Arena) -> Probe {
+    match client.get(arena.url("/readyz")).send().await {
+        Ok(response) => Probe::Status(response.status().as_u16()),
+        Err(_) => Probe::Refused,
+    }
+}
+
+/// Poll readiness until the arena answers ready, failing if it exits first.
+async fn wait_ready(arena: &mut Arena) {
     let client = fresh_client();
     let started = Instant::now();
     loop {
-        let outcome = match client.get(arena.url(path)).send().await {
-            Ok(response) => Some(response.status()),
-            Err(err) if err.is_connect() => None,
-            Err(err) => panic!("GET {path}: {err}"),
-        };
-        if done(outcome) {
+        assert!(arena.is_running(), "the arena exited before it was ready");
+        if probe(&client, arena).await == Probe::Status(200) {
             return;
         }
-        assert!(started.elapsed() < BOUND, "timed out waiting for {what}");
+        assert!(started.elapsed() < BOUND, "the arena never became ready");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -167,10 +174,7 @@ async fn sigterm_drains_the_request_in_flight_and_exits_zero() {
     let release = Arc::new(Notify::new());
     let (backend, mut arrived) = spawn_stub_backend(release.clone()).await;
     let mut arena = Arena::spawn(&backend);
-    poll_until(&arena, "/readyz", "the arena to become ready", |status| {
-        status == Some(reqwest::StatusCode::OK)
-    })
-    .await;
+    wait_ready(&mut arena).await;
 
     // The slow request: in flight until the stub backend is released.
     let in_flight = tokio::spawn({
@@ -193,34 +197,53 @@ async fn sigterm_drains_the_request_in_flight_and_exits_zero() {
 
     arena.signal("TERM");
 
-    // Readiness fails at once while the arena still accepts: a 503, not a refused
-    // connection, during the drain delay.
-    poll_until(&arena, "/readyz", "readiness to answer 503", |status| {
-        assert!(status.is_some(), "the arena stopped accepting before 503");
-        status == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
-    })
-    .await;
-    // Liveness holds, and a new match is refused, while it drains.
+    // Readiness answers 503 through the drain delay, then nothing accepts. While it
+    // answers 503, liveness holds and a new match is still served.
     let client = fresh_client();
-    let health = client.get(arena.url("/healthz")).send().await.unwrap();
-    assert_eq!(health.status(), reqwest::StatusCode::OK);
-    let refused = client
-        .post(arena.url("/matches"))
-        .header(IDENTITY, "dev@local")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let refused: serde_json::Value = refused.json().await.unwrap();
-    assert_eq!(refused["error"]["code"], "stopping", "{refused}");
-
-    // After the drain delay it stops accepting, yet stays up for the request in
-    // flight.
-    poll_until(&arena, "/readyz", "the arena to stop accepting", |status| {
-        status.is_none()
-    })
-    .await;
+    let started = Instant::now();
+    let mut seen: Vec<Probe> = Vec::new();
+    loop {
+        let answer = probe(&client, &arena).await;
+        if answer == Probe::Status(503) && !seen.contains(&answer) {
+            let health = client.get(arena.url("/healthz")).send().await.unwrap();
+            assert_eq!(health.status(), reqwest::StatusCode::OK);
+            // The stub resolves no version, so a served match is a 400 naming it;
+            // a refused one would be a 503 `stopping`.
+            let served = client
+                .post(arena.url("/matches"))
+                .header(IDENTITY, "dev@local")
+                .json(&serde_json::json!({
+                    "testCase": "pacman",
+                    "version": "1.0.0",
+                    "red": { "id": "random", "kind": "baseline" },
+                    "blue": { "id": "greedy-raider", "kind": "baseline" }
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(served.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        if seen.last() != Some(&answer) {
+            seen.push(answer);
+        }
+        if answer == Probe::Refused {
+            break;
+        }
+        assert!(
+            started.elapsed() < BOUND,
+            "the arena never stopped accepting: {seen:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A probe raced with the signal may still have found it ready.
+    if seen.first() == Some(&Probe::Status(200)) {
+        seen.remove(0);
+    }
+    assert_eq!(
+        seen,
+        [Probe::Status(503), Probe::Refused],
+        "readiness answers 503 through the drain delay, then nothing accepts"
+    );
     assert!(
         arena.is_running(),
         "the arena exited with a request in flight"
@@ -248,10 +271,7 @@ async fn an_interrupt_stops_the_arena_with_status_zero() {
     let release = Arc::new(Notify::new());
     let (backend, _arrived) = spawn_stub_backend(release).await;
     let mut arena = Arena::spawn(&backend);
-    poll_until(&arena, "/readyz", "the arena to become ready", |status| {
-        status == Some(reqwest::StatusCode::OK)
-    })
-    .await;
+    wait_ready(&mut arena).await;
 
     arena.signal("INT");
     let exit = arena.exit_status().await;

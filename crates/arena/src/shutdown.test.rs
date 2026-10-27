@@ -34,6 +34,34 @@ fn shutdown_latches_for_every_clone() {
     assert!(shutdown.is_draining());
 }
 
+#[test]
+fn refusing_comes_after_draining_and_implies_it() {
+    let shutdown = Shutdown::new();
+    shutdown.begin();
+    assert!(!shutdown.is_refusing());
+    shutdown.refuse();
+    assert!(shutdown.is_refusing());
+    // A later `begin` never moves it back.
+    shutdown.begin();
+    assert!(shutdown.is_refusing());
+
+    let fresh = Shutdown::new();
+    fresh.refuse();
+    assert!(fresh.is_refusing());
+    assert!(fresh.is_draining());
+}
+
+#[tokio::test]
+async fn a_waiter_wakes_when_the_delay_ends_without_a_begin() {
+    let shutdown = Shutdown::new();
+    let waiter = tokio::spawn(shutdown.draining());
+    shutdown.refuse();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter wakes")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn the_drives_are_idle_once_every_guard_drops() {
     let drives = Drives::new();

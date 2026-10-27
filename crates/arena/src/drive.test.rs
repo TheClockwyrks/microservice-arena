@@ -257,7 +257,14 @@ async fn a_shutdown_records_the_match_in_progress_and_a_restart_resumes_the_rest
     }
     assert_eq!(first_runner.played().len(), 2);
 
-    // A shutting-down arena accepts no new work and fails its readiness probe.
+    // A draining arena fails its readiness probe while liveness holds.
+    let ready = send(&first_app, "GET", "/readyz", None).await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let health = send(&first_app, "GET", "/healthz", None).await;
+    assert_eq!(health.status(), StatusCode::OK);
+
+    // Once its drain delay ends, it accepts no new work.
+    first.shutdown.refuse();
     assert_eq!(
         submit(&first_app, &FIELD).await.status(),
         StatusCode::SERVICE_UNAVAILABLE
@@ -275,10 +282,6 @@ async fn a_shutdown_records_the_match_in_progress_and_a_restart_resumes_the_rest
     )
     .await;
     assert_eq!(quick.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let ready = send(&first_app, "GET", "/readyz", None).await;
-    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let health = send(&first_app, "GET", "/healthz", None).await;
-    assert_eq!(health.status(), StatusCode::OK);
 
     // The restarted arena answers the same recorded state before it resumes.
     let second_runner = ScriptedRunner::default();
@@ -327,11 +330,7 @@ async fn a_queued_tournament(url: &str, backend: &Backend) -> String {
         ..ScriptedRunner::default()
     };
     let state = arena(url, 1, &runner);
-    // A shutdown before the submit's drive starts leaves the tournament queued.
-    state.shutdown.begin();
-    let app = router(&state);
-    // The submit itself is refused while draining, so record it directly.
-    let _ = app;
+    // Recorded directly, as a submit does before its drive starts.
     let pending = test_cabinet_match_play::PendingTournament {
         id: "queued".to_string(),
         created_at: "2026-10-26T00:00:00Z".to_string(),
@@ -359,6 +358,36 @@ async fn a_queued_tournament(url: &str, backend: &Backend) -> String {
         .await
         .unwrap();
     pending.id
+}
+
+#[tokio::test]
+async fn a_tournament_accepted_during_the_drain_delay_is_left_queued_for_the_next_arena() {
+    let backend = Backend::default();
+    let url = spawn_stub_backend_with(backend.clone()).await;
+
+    // Told to stop, but still in its drain delay: the submit is served, recorded,
+    // and not played here.
+    let first_runner = ScriptedRunner::default();
+    let first = arena(&url, 2, &first_runner);
+    first.shutdown.begin();
+    let id = submit_field(&router(&first)).await;
+    first.drives.idle().await;
+    assert!(
+        first_runner.played().is_empty(),
+        "nothing plays while stopping"
+    );
+    assert_eq!(
+        backend.lock().unwrap().tournaments[&id].state,
+        TournamentState::Queued
+    );
+
+    // The next arena resumes it.
+    let second_runner = ScriptedRunner::default();
+    let second = arena(&url, 2, &second_runner);
+    crate::drive::resume_unfinished(second.clone()).await;
+    second.drives.idle().await;
+    assert_eq!(second_runner.played().len(), 6);
+    assert_succeeded_with_every_replay(&backend, &id);
 }
 
 #[tokio::test]
