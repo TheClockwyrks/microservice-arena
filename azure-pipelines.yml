@@ -94,10 +94,10 @@ resources:
   # with `scripts/repos/render.py --update`.
   containers:
     - container: rust
-      image: testcabinet.azurecr.io/ubuntu-the-test-cabinet-rust-cicd:af509db605fd49250ddd49aece1177ab9f5d69d1
+      image: testcabinet.azurecr.io/ubuntu-the-test-cabinet-rust-cicd:32214df70437d8fcb84a52e050e52bf0dfb767a4
       endpoint: the-test-cabinet-acr
     - container: web
-      image: testcabinet.azurecr.io/ubuntu-the-test-cabinet-web-cicd:af509db605fd49250ddd49aece1177ab9f5d69d1
+      image: testcabinet.azurecr.io/ubuntu-the-test-cabinet-web-cicd:32214df70437d8fcb84a52e050e52bf0dfb767a4
       endpoint: the-test-cabinet-acr
 
 pool:
